@@ -11,6 +11,7 @@ from galvatron.models.llama_hf.dataloader import DataLoaderForLlama
 from galvatron.models.llama_hf.meta_configs import config_from_meta, set_model_config, model_name, model_layer_configs
 from galvatron.models.llama_hf.arguments import model_args
 
+from megatron.arguments import _print_args
 
 def train(args):
     local_rank = args.local_rank
@@ -23,17 +24,28 @@ def train(args):
     config = set_model_config(config, args, False)
     if local_rank == 0:
         print(config)
+        _print_args("arguments", args)
     
     hybrid_parallel_configs = get_hybrid_parallel_configs(model_config=config, training_args=args)
     if local_rank == 0:
         print("Creating Model...")
+    
     llama_model = LlamaForCausalLM(config)
+    
+    # if local_rank == 0:
+    #     for p,q in llama_model.named_parameters():
+    #         print(p,q.numel())
+    
     model = construct_hybrid_parallel_model(
         model=llama_model, 
         model_config=config, 
         training_args=args, 
         hybrid_parallel_configs=hybrid_parallel_configs
     )
+    
+    # if local_rank == 0:
+    #     for p,q in model.named_parameters():
+    #         print(p,q.numel())
     
     # from galvatron.models.llama import llama_model_hp
     # model = llama_model_hp(config, args)
@@ -44,7 +56,8 @@ def train(args):
         dataset=DataLoaderForLlama(args, device),
         global_bsz=args.global_train_batch_size,
         shuffle=True,
-        args=args
+        args = args,
+        group = model.dp_groups_whole[0].group
     )
     
     optimizer = Adam(model.parameters(), lr=args.lr, weight_decay=args.adam_weight_decay)
@@ -56,31 +69,46 @@ def train(args):
     profiler.profile_memory(0, "After creating model")
     if local_rank == 0:
         print("Start training...")
-    for ep in range(args.epochs):
-        if not args.check_loss and not args.profile:
-            trainloader = tqdm(trainloader)
-        for iter, batch in enumerate(trainloader):
-            profiler.profile_time_start(iter)
-            profiler.profile_memory(iter, "Before Forward")
+        
+    # torch.cuda.memory._record_memory_history(max_entries=100000)
+    # t = 0
+    # from torch.profiler import profile, record_function, ProfilerActivity
+    # with profile(activities=[ProfilerActivity.CUDA], record_shapes=True) as prof:
+    if True:
+        for ep in range(args.epochs):
+            if not args.check_loss and not args.profile:
+                trainloader = tqdm(trainloader)
+            for iter, batch in enumerate(trainloader):
+                profiler.profile_time_start(iter)
+                profiler.profile_memory(iter, "Before Forward")
 
-            input_ids = batch
-            batch = [input_ids]
-            
-            loss = model.forward_backward(batch, iter, profiler)
-            
-            profiler.profile_memory(iter, "After Backward")
-            
-            optimizer.step()
-            
-            profiler.profile_memory(iter, "After optimizer_step")
-            
-            optimizer.zero_grad()
-            
-            print_loss(args, loss, ep, iter)
+                input_ids = batch
+                batch = [input_ids]
+                
+                loss = model.forward_backward(batch, iter, profiler)
+                
+                profiler.profile_memory(iter, "After Backward")
+                
+                optimizer.step()
+                
+                profiler.profile_memory(iter, "After optimizer_step")
+                
+                optimizer.zero_grad()
+                
+                # t += 1
+                # if t == 3:
+                #     break
+                
+                print_loss(args, loss, ep, iter)
 
-            profiler.post_profile_memory(iter)
-            profiler.profile_time_end(iter)
-
+                profiler.post_profile_memory(iter)
+                profiler.profile_time_end(iter)
+            # if t == 3:
+            #     break
+        # torch.cuda.memory._dump_snapshot(f"13B_layer8_rank_{local_rank}.pickle")
+        # torch.cuda.memory._record_memory_history(enabled=None)
+    # prof.export_chrome_trace(f"trace_{local_rank}.json")
+    
 if __name__ == '__main__':
     args = initialize_galvatron(model_args, mode='train_dist')
     set_seed()

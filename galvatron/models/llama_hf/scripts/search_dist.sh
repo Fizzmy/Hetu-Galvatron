@@ -1,22 +1,22 @@
-export NUM_NODES=2
+export NUM_NODES=1
 export NUM_GPUS_PER_NODE=8
 
-MODEL_SIZE="llama-7b"
-MEMORY=34
+MODEL_SIZE="llama-13b"
+MEMORY=35
 
 MODEL_ARGS="
     --model_size ${MODEL_SIZE} \
     --set_model_config_manually 0 \
-    --set_layernum_manually 0 \
+    --set_layernum_manually 1 \
     --vocab_size 32000 \
     --hidden_size 4096 \
-    --num_hidden_layers 32 \
+    --num_hidden_layers 8 \
     --num_attention_heads 32 \
     --seq_length 2048"
 
 BSZ_ARGS="
     --min_bsz 16 \
-    --max_bsz 1024 \
+    --max_bsz 16 \
     --bsz_scale 16 \
     --settle_bsz -1 \
     --recommend_min_bsz 0
@@ -27,7 +27,7 @@ SEARCH_SPACE_ARGS="
     --disable_dp 0 \
     --disable_tp 0 \
     --disable_pp 0 \
-    --disable_sdp 0 \
+    --disable_sdp 1 \
     --disable_ckpt 0 \
     --disable_tp_consec 0 \
     --max_tp_deg 8 \
@@ -43,7 +43,7 @@ SEARCH_ARGS="
     --memory_constraint $MEMORY \
     --mixed_precision bf16 \
     --pipeline_type pipedream_flush \
-    --default_dp_type zero2 \
+    --default_dp_type ddp \
     --embed_sdp 0
 "
 

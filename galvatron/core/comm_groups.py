@@ -161,6 +161,7 @@ def gen_redistributed_group(tp_size_old, tp_size_new, tp_consec_old, tp_consec_n
     return (tp_group_old, tp_group_new)
 
 def merge_redistributed_group(split_group, allgather_group):
+    return None, None
     if split_group is None or allgather_group is None:
         return None, None
 
@@ -178,6 +179,7 @@ def merge_redistributed_group(split_group, allgather_group):
     if split_consecutive == 0 or allgather_consecutive == 0:
         return None, None
 
+    # TODO: allgather pp+tp group
     if split_tp_size > allgather_tp_size:
         rank = torch.distributed.get_rank()
         mul = split_tp_size // allgather_tp_size
@@ -230,7 +232,6 @@ def gen_comm_groups(all_tp_sizes, pp_size, tp_consecutive_flags, show_rank = -1,
         fused_split_groups.append(fused_split_group)
         fused_allgather_groups.append(fused_allgather_group)
     
-    show_rank = 5
     if show_rank >= 0 and torch.distributed.get_rank() == show_rank:
         print('====================== Galvatron Communication Group ===========================')
         print("TP groups for rank %d (all layers):"%show_rank)

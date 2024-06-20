@@ -177,7 +177,7 @@ class TimeCostModel:
         self.layer_type = layer_type
         assert(layer_type in ['enc', 'dec'])
         self.optimal_microbatch = optimal_chunk_func(self.bs, self.s) if microbatch else 1
-
+        # print(self.microbatch,self.optimal_microbatch)
         # Dummy layer_num, can be any multiple of 8.
         # We estimate the time cost of single layer by averaging the time of whole model to deal with pipeline parallel
         self.layer_num = 24 if layer_num is None else layer_num
@@ -379,20 +379,22 @@ def pipeline_costmodel(timecostmodel, layer_num_list, timecostmodel_args_list, s
     for layer_type_id in range(len(layer_num_list)):
         layer_type_ids += [layer_type_id] * layer_num_list[layer_type_id]
     if isinstance(chunks, list):
-        chunks = [get_real_chunk(int(bsz/strategies[0][1]/strategies[0][2]), chunks_) for chunks_ in chunks]
+        # chunks = [get_real_chunk(int(bsz/strategies[0][1]/strategies[0][2]), chunks_) for chunks_ in chunks]
         bsz_chunked = [bsz / chunks_ for chunks_ in chunks]
         max_chunk = np.max(chunks)
         # print('Detected multi chunks!', chunks, 'Using %d as chunks!'%max_chunk)
     else:
-        chunks = get_real_chunk(int(bsz/strategies[0][1]/strategies[0][2]), chunks)
+        # chunks = get_real_chunk(int(bsz/strategies[0][1]/strategies[0][2]), chunks)
         bsz_chunked = [bsz / chunks] * len(layer_num_list)
         # print(bsz, bsz/chunks, chunks)
         max_chunk = chunks
-    # print(bsz_chunked)
+    print(bsz_chunked)
+    
     pp_deg = len(partition)
     layer_num = len(strategies)
     from galvatron.utils import form_strategy, strategy_str2list
     strategies_set = list(set([form_strategy(s) for s in strategies]))
+    print(strategies_set)
     timecosts_dict_bsz_chunked, timecosts_dict_compute = {}, {}
     for layer_type_id in range(len(layer_num_list)):
         timecosts_dict_bsz_chunked[layer_type_id], timecosts_dict_compute[layer_type_id] = {}, {}
@@ -403,23 +405,24 @@ def pipeline_costmodel(timecostmodel, layer_num_list, timecostmodel_args_list, s
     timecosts_bsz_compute = [timecosts_dict_compute[layer_type_ids[i]][form_strategy(strategies[i])] for i in range(layer_num)]
     stage_costs_bsz_chunked = get_time_cost_all_stages(timecosts_bsz_chunked, partition)
     stage_costs_compute = get_time_cost_all_stages(timecosts_bsz_compute, partition)
-    # print(timecosts_bsz_chunked, stage_costs_bsz_chunked, np.sum(stage_costs_bsz_chunked))
-    # print(stage_costs_compute, np.max(stage_costs_compute))
-    # print(np.sum(stage_costs_bsz_chunked), np.max(stage_costs_compute), np.max(stage_costs_compute) * (max_chunk-1))
+    print(timecosts_bsz_chunked, stage_costs_bsz_chunked, np.sum(stage_costs_bsz_chunked))
+    print(stage_costs_compute, np.max(stage_costs_compute))
+    print(np.sum(stage_costs_bsz_chunked), np.max(stage_costs_compute), np.max(stage_costs_compute) * (max_chunk-1))
     
     # # p2p & reduce sync
     # result = np.sum(stage_costs_bsz_chunked) + np.max(stage_costs_compute) * (max_chunk-1)
     
     # p2p & reduce async
     stage_costs_reduce = [total for total in stage_costs_bsz_chunked]
-    # print(stage_costs_compute, stage_costs_reduce, stage_costs_bsz_chunked)
+    print(stage_costs_compute, stage_costs_reduce, stage_costs_bsz_chunked)
+    print(np.max(stage_costs_compute), max_chunk-1+pp_deg)
     result = np.max(stage_costs_compute) * (max_chunk-1+pp_deg)
     for i in range(pp_deg):
         stage_costs_reduce[i] -= np.sum(stage_costs_compute[:i+1])
     reduce_time = np.max(stage_costs_reduce)
     reduce_time = reduce_time if reduce_time > 0 else 0
     
-    # print(result,reduce_time)
+    print(max_chunk,result,reduce_time)
     result += reduce_time
     
     if return_stage_cost:

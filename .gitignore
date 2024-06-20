@@ -12,3 +12,7 @@ dist/
 log/
 *.o
 *.so
+
+*.log
+*.pickle
+galvatron/models/llama_hf/configs/galvatron_config_hidden5120_head40_seqlen2048*
