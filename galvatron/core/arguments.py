@@ -1,5 +1,5 @@
-from megatron.initialize import initialize_megatron
-from megatron import get_args as get_megatron_args
+from megatron.training.initialize import initialize_megatron
+from megatron.training import get_args as get_megatron_args
 import argparse
 
 def initialize_galvatron(model_args = None, mode="train_dist"):
@@ -51,6 +51,9 @@ def galvatron_training_args(parser, use_megatron=True):
         "--set_layernum_manually", type=int, default=0, help="Whether to set layernum config manually (doesn't overwrite other model configs)."
     )
     group.add_argument(
+        "--set_seqlen_manually", type=int, default=0, help="Whether to set sequence length config manually (doesn't overwrite other model configs)."
+    )
+    group.add_argument(
         "--initialize_on_meta", type=int, default=0, help="Whether to initialize parameters on meta device.", choices=[0, 1]
     )
     group.add_argument(
@@ -76,6 +79,9 @@ def galvatron_training_args(parser, use_megatron=True):
     group.add_argument(
         "--profile_type", type=str, default="allocated", help="Profile allocated memory or reserved memory.",
         choices = ["allocated", "reserved"],
+    )
+    group.add_argument(
+        "--profile_mode", type=str, default="static", help="Galvatron profiling mode", choices=["static", "batch", "sequence"]
     )
     group.add_argument(
         "--load_params", type=int, default=0, help="Whether to load saved init params."
@@ -126,7 +132,16 @@ def galvatron_training_args(parser, use_megatron=True):
         "--shape_order", type=str, default='SBH', help="Model shape order.", choices=['SBH', 'BSH'],
     )
     group.add_argument(
-        "--vocab_tp", type=int, default=1, help="Tensor parallel degree of vocab.", choices=[1,2,4,8],
+        "--vocab_tp", type=int, default=1, help="Tensor parallel degree of vocab.", choices=[1,2,4,8,16],
+    )
+    group.add_argument(
+        "--use-ulysses", action="store_true", help="Whether to use DeepSpeed Ulysses or Megatron-TP",
+    )
+    group.add_argument(
+        "--no_async_grad_reduce", action="store_false",
+        help='Disable async grad reduce so that gradient will be reduce every micro batch. '
+        'Ensure Zero3 memory cost when chunk > 1.',
+        dest='async_grad_reduce'
     )
     if not use_megatron:
         group.add_argument("--lr", type=float, default=1e-4, help="Learning rate of adam")
@@ -149,7 +164,31 @@ def galvatron_profile_args(parser):
         "--set_layernum_manually", type=int, default=1, help="Whether to set layernum config manually (doesn't overwrite other model configs)."
     )
     group.add_argument(
-        "--profile_batch_size", type=int, default=32, help="Galvatron profiling batch size"
+        "--set_seqlen_manually", type=int, default=0, help="Whether to set sequence length config manually (doesn't overwrite other model configs)."
+    )
+    group.add_argument(
+        "--profile_mode", type=str, default="static", help="Galvatron profiling mode", choices=["static", "batch", "sequence", "hybrid"]
+    )
+    group.add_argument(
+        "--profile_batch_size", type=int, default=None, help="Galvatron profiling batch size"
+    )
+    group.add_argument(
+        "--profile_min_batch_size", type=int, default=None, help="Galvatron profiling min batch size"
+    )
+    group.add_argument(
+        "--profile_max_batch_size", type=int, default=None, help="Galvatron profiling max batch size"
+    )
+    group.add_argument(
+        "--profile_batch_size_step", type=int, default=1, help="Galvatron profiling batch size step"
+    )
+    group.add_argument(
+        "--profile_min_seq_length", type=int, default=None, help="Galvatron profiling max sequence length"
+    )
+    group.add_argument(
+        "--profile_max_seq_length", type=int, default=None, help="Galvatron profiling max sequence length"
+    )
+    group.add_argument(
+        "--profile_seq_length_step", type=int, default=128, help="Galvatron profiling sequence length step"
     )
     group.add_argument(
         "--layernum_min", type=int, default=1, help="Layernum min for profiling."
@@ -170,16 +209,20 @@ def galvatron_profile_args(parser):
         "--use-flash-attn", action="store_true", help="Use FlashAttention implementation of attention."
     )
     group.add_argument(
+        "--extra_args_str", type=str, default="", help="Extra arguments for megatron initilization."
+    )
+    
+    group.add_argument(
+        "--sequence_parallel", action="store_true", help="Whether to use sequence parallel",
+    )
+    
+    group.add_argument(
         "--shape_order", type=str, default='SBH', help="Model shape order.", choices=['SBH', 'BSH'],
     )
-
+    
     group.add_argument('--make-vocab-size-divisible-by', type=int, default=128,
                        help='Pad the vocab size to be divisible by this value.'
                        'This is added for computational efficieny reasons.')
-    
-    group.add_argument(
-        "--extra_args_str", type=str, default="", help="Extra arguments for megatron initilization."
-    )
     
     return parser
 
@@ -233,6 +276,9 @@ def galvatron_search_args(parser):
         "--set_layernum_manually", type=int, default=0, help="Whether to set layernum config manually (doesn't overwrite other model configs)."
     )
     group.add_argument(
+        "--set_seqlen_manually", type=int, default=0, help="Whether to set sequence length config manually (doesn't overwrite other model configs)."
+    )
+    group.add_argument(
         "--num_nodes", type=int, default=1, help="Number of Nodes.",
     )
     group.add_argument(
@@ -263,10 +309,16 @@ def galvatron_search_args(parser):
         "--search_space", type=str, default="full", help="Galvatron parallelism optimization type.", choices=["full","dp+tp","dp+pp", "3d", "dp", "sdp", "tp", "pp"],
     )
     group.add_argument(
+        "--sp_space", type=str, default="tp", help="Galvatron sequence parallelism optimization type.", choices=["tp+sp","tp","sp"],
+    )
+    group.add_argument(
         "--disable_dp", type=int, default=0, help="Whether to disable dp."
     )
     group.add_argument(
         "--disable_tp", type=int, default=0, help="Whether to disable tp."
+    )
+    group.add_argument(
+        "--disable_vtp", type=int, default=0, help="Whether to disable vocab tp."
     )
     group.add_argument(
         "--disable_pp", type=int, default=0, help="Whether to disable pp."
@@ -304,10 +356,27 @@ def galvatron_search_args(parser):
     group.add_argument(
         "--costmodel_coe", type=float, default=1.0, help="Multiply the outcome of time cost model by this coefficient. Only for fine-tuning time cost model, should be 1.0 in default.",
     )
+    group.add_argument(
+        "--sequence_parallel", action="store_true", help="Whether to use sequence parallel",
+    )
+    group.add_argument(
+        "--no_global_memory_buffer", action="store_false",
+        help='Disable the estimation of global memory for all gather buffer when using Megatron-SP.',
+        dest='global_memory_buffer'
+    )
+    group.add_argument(
+        "--no_async_grad_reduce", action="store_false",
+        help='Disable async grad reduce so that gradient will be reduce every micro batch. '
+        'Ensure Zero3 memory cost when chunk > 1.',
+        dest='async_grad_reduce'
+    )
     
     group.add_argument('--make-vocab-size-divisible-by', type=int, default=128,
                        help='Pad the vocab size to be divisible by this value.'
                        'This is added for computational efficieny reasons.')
     
-    
+    group.add_argument("--fine_grained_mode", type=int, default=1, help="Enable fine-grained search.")
+    group.add_argument(
+        "--profile_mode", type=str, default="static", help="Galvatron profiling mode", choices=["static", "batch", "sequence", "hybrid"]
+    )
     return parser

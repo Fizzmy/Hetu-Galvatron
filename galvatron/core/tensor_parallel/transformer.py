@@ -1,22 +1,24 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Transformer."""
 from contextlib import nullcontext
+import os
 import math
 import numpy as np
 import torch
 import torch.nn.functional as F
 from typing import Optional
 
-from megatron import get_timers, get_args, get_retro_args, core, get_num_microbatches
-from megatron.model.module import MegatronModule
+from megatron import core
+from megatron.training import get_timers, get_args, get_num_microbatches
+from megatron.legacy.model.module import MegatronModule
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
-from megatron.model.enums import AttnMaskType, LayerType, AttnType
-from megatron.model.fused_softmax import FusedScaleMaskSoftmax
-from megatron.model.fused_bias_gelu import bias_gelu_impl
+from megatron.legacy.model.enums import AttnMaskType, LayerType, AttnType
+from megatron.legacy.model.fused_softmax import FusedScaleMaskSoftmax
+from megatron.legacy.model.fused_bias_gelu import bias_gelu_impl
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding, apply_rotary_pos_emb
-from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu, get_norm
+from megatron.legacy.model.utils import attention_mask_func, openai_gelu, erf_gelu, get_norm
 from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region_to_moe,
     reduce_scatter_to_sequence_parallel_region_from_moe,
@@ -24,6 +26,7 @@ from megatron.core.tensor_parallel import (
     get_data_parallel_rng_tracker_name
 )
 from megatron.core.parallel_state import get_tensor_model_parallel_group, get_tensor_and_expert_parallel_group
+from megatron.core.jit import jit_fuser
 
 try:
     from einops import rearrange
@@ -506,15 +509,17 @@ class ParallelAttention(MegatronModule):
     def __init__(self, config, layer_number,
                  attention_type=AttnType.self_attn,
                  attn_mask_type=AttnMaskType.padding,
-                 tp_group=None):
+                 tp_group=None, sp_group = None, use_ulysses = False):
         super(ParallelAttention, self).__init__()
         args = get_args()
+        self.use_ulysses = use_ulysses
+        
         self.layer_number = max(1, layer_number)
         self.attention_type = attention_type
         self.attn_mask_type = attn_mask_type
         self.params_dtype = config.params_dtype
         self.sequence_parallel = config.sequence_parallel
-
+        self.config = config
         self.group_query_attention = args.group_query_attention
         self.num_query_groups = args.num_query_groups
 
@@ -543,6 +548,10 @@ class ParallelAttention(MegatronModule):
             world_size = mpu.get_tensor_model_parallel_world_size()
         else:
             world_size = tensor_parallel.get_tensor_model_parallel_world_size_group(tp_group)
+        if sp_group is None:
+            sp_world_size = 1
+        else:
+            sp_world_size = torch.distributed.get_world_size(sp_group)
         self.hidden_size_per_attention_head = core.utils.divide(
             query_projection_size, config.num_attention_heads)
         self.num_attention_heads_per_partition = core.utils.divide(
@@ -564,7 +573,7 @@ class ParallelAttention(MegatronModule):
                 query_projection_size + 2 * kv_projection_size,
                 config=config,
                 init_method=config.init_method,
-                bias=args.add_bias_linear,
+                bias=args.add_bias_linear or args.add_qkv_bias,
                 gather_output=False,
                 tp_group=tp_group)
         else:
@@ -600,7 +609,11 @@ class ParallelAttention(MegatronModule):
             self.core_attention_flash = FlashSelfAttention(
                 causal=True, attention_dropout=config.attention_dropout
             )
-
+        if self.use_ulysses:
+            assert args.num_attention_heads % sp_world_size == 0
+            self.dist_attn = DistributedAttention(self.core_attention_flash if self.use_flash_attn else self.core_attention, sp_group, 
+                                                  gather_idx = 1 if self.use_flash_attn else 0,)
+            #flash attn [B,S,H,D] gather_idx = 1, normal attn [S,B,H,D] gather_idx = 0
         # Output.
         self.dense = tensor_parallel.RowParallelLinear(
             query_projection_size,
@@ -705,7 +718,11 @@ class ParallelAttention(MegatronModule):
                 dim=3)
 
             # [sq, b, ng, np/ng * hn] -> [sq, b, np, hn] -
-            query_layer = query_layer.view(query_layer.size(0), query_layer.size(1), -1, self.hidden_size_per_attention_head)
+            # TODO: check if it is necessary to reshape
+            if self.group_query_attention:
+                query_layer = query_layer.reshape(query_layer.size(0), query_layer.size(1), -1, self.hidden_size_per_attention_head)
+            else:
+                query_layer = query_layer.view(query_layer.size(0), query_layer.size(1), -1, self.hidden_size_per_attention_head)
         else:
             # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
             mixed_kv_layer, _ = self.key_value(encoder_output)
@@ -795,29 +812,42 @@ class ParallelAttention(MegatronModule):
         # apply relative positional encoding (rotary embedding)
         if rotary_pos_emb is not None:
             q_pos_emb, k_pos_emb = rotary_pos_emb
-            query_layer = apply_rotary_pos_emb(query_layer, q_pos_emb)
-            key_layer = apply_rotary_pos_emb(key_layer, k_pos_emb)
+            query_layer = apply_rotary_pos_emb(query_layer, q_pos_emb,self.config)
+            key_layer = apply_rotary_pos_emb(key_layer, k_pos_emb,self.config)
             # TODO, can apply positional embedding to value_layer so it has
             # absolute positional embedding.
             # otherwise, only relative positional embedding takes effect
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
 
-        if not self.use_flash_attn:
-            if self.checkpoint_core_attention:
-                context_layer = self._checkpointed_attention_forward(
-                    query_layer, key_layer, value_layer, attention_mask)
+        if self.use_ulysses:
+            if self.use_flash_attn:
+                batch_dim_idx = 0
+                query_layer, key_layer, value_layer = [rearrange(x, 's b ... -> b s ...').contiguous()
+                            for x in (query_layer, key_layer, value_layer)]
+                
+                context_layer = self.dist_attn(query_layer, key_layer, value_layer, batch_dim_idx)
+                context_layer = rearrange(context_layer, 'b s h d -> s b (h d)').contiguous()     
             else:
-                context_layer = self.core_attention(
-                    query_layer, key_layer, value_layer, attention_mask)
-        else:
-            q, k, v = [rearrange(x, 's b ... -> b s ...').contiguous()
-                       for x in (query_layer, key_layer, value_layer)]
-            if not self.sequence_parallel:
-                with tensor_parallel.get_cuda_rng_tracker().fork():
+                batch_dim_idx = 1 # [S,B,H,D]
+                context_layer = self.dist_attn(query_layer, key_layer, value_layer, batch_dim_idx, attention_mask)
+                context_layer = rearrange(context_layer, '... h d -> ... (h d)').contiguous() 
+        else: 
+            if not self.use_flash_attn:
+                if self.checkpoint_core_attention:
+                    context_layer = self._checkpointed_attention_forward(
+                        query_layer, key_layer, value_layer, attention_mask)
+                else:
+                    context_layer = self.core_attention(
+                        query_layer, key_layer, value_layer, attention_mask)
+            else:
+                q, k, v = [rearrange(x, 's b ... -> b s ...').contiguous()
+                        for x in (query_layer, key_layer, value_layer)]
+                if not self.sequence_parallel:
+                    with tensor_parallel.get_cuda_rng_tracker().fork():
+                        context_layer = self.core_attention_flash(q, k, v)
+                else:
                     context_layer = self.core_attention_flash(q, k, v)
-            else:
-                context_layer = self.core_attention_flash(q, k, v)
-            context_layer = rearrange(context_layer, 'b s h d -> s b (h d)').contiguous()
+                context_layer = rearrange(context_layer, 'b s h d -> s b (h d)').contiguous()
 
         # =================
         # Output. [sq, b, h]
@@ -843,7 +873,7 @@ def get_bias_dropout_add(training):
     return _bias_dropout_add
 
 
-@torch.jit.script
+@jit_fuser
 def bias_dropout_add_fused_train(x: torch.Tensor,
                                  bias: Optional[torch.Tensor],
                                  residual: torch.Tensor,
@@ -851,7 +881,7 @@ def bias_dropout_add_fused_train(x: torch.Tensor,
     return bias_dropout_add(x, bias, residual, prob, True)
 
 
-@torch.jit.script
+@jit_fuser
 def bias_dropout_add_fused_inference(x: torch.Tensor,
                                      bias: Optional[torch.Tensor],
                                      residual: torch.Tensor,
@@ -924,10 +954,10 @@ class ParallelTransformerLayer(MegatronModule):
                 nullcontext if use_nvfuser else torch.enable_grad
 
         if args.retro_add_retriever:
-            retro_args = get_retro_args()
             self.retro_num_neighbors = args.retro_num_neighbors
-            self.retro_chunk_length = retro_args.retro_gpt_chunk_length
-            self.retro_retrieved_length = retro_args.retro_gpt_retrieved_length
+            self.retro_chunk_length = args.retro_chunk_length
+            self.retro_retrieved_length = \
+                args.retro_num_retrieved_chunks * args.retro_chunk_length
 
         # Retriever (bi-directional transformer with cross attention)
         if layer_type == LayerType.retro_decoder_with_retriever:
@@ -1072,7 +1102,6 @@ class ParallelTransformerLayer(MegatronModule):
         if self.layer_type == LayerType.retro_decoder_with_retriever:
             first_ns = ns % self.retro_chunk_length
             if first_ns > 0:
-                raise Exception("test this case.")
                 first_chunk, rest_chunk = \
                     norm_output[:first_ns], norm_output[first_ns:]
                 first_chunk = torch.nn.functional.pad(
@@ -1140,7 +1169,9 @@ class ParallelTransformerLayer(MegatronModule):
                 norm_input,
                 (0, 0, 0, 0, pad, 0),
                 'constant', 0)[:ns] # [ns, b, d]
-            norm_input = norm_input + residual
+            # TODO: better redesign with inference param
+            args = get_args()
+            norm_input = args.retro_attention_gate * norm_input + residual
 
         # Layer norm post the decoder attention
         norm_output = self.post_inter_attention_norm(norm_input)
@@ -1154,6 +1185,16 @@ class ParallelTransformerLayer(MegatronModule):
                 retriever_attn_mask=None,
                 inference_params=None,
                 rotary_pos_emb=None):
+
+        # Update the params in case the retro param changes during inference
+        # TODO: better redesign with inference param
+        args = get_args()
+        if args.retro_add_retriever:
+            self.retro_num_neighbors = args.retro_num_neighbors
+            self.retro_chunk_length = args.retro_chunk_length
+            self.retro_retrieved_length = \
+                args.retro_num_retrieved_chunks * args.retro_chunk_length
+
         # hidden_states: [s, b, h]
 
         # Layer norm at the beginning of the transformer layer.
@@ -1500,6 +1541,10 @@ class ParallelTransformer(MegatronModule):
                     extra_transformer_engine_kwargs["activation"] = "swiglu" if args.swiglu else "gelu"
                 if self.transformer_engine_v_0_11:
                     extra_transformer_engine_kwargs["normalization"] = args.normalization
+                assert config.attention_softmax_in_fp32, "TransformerEngine only supports softmax compute in FP32."
+                assert (
+                    (bool(int(os.getenv("NVTE_APPLY_QK_LAYER_SCALING", "0"))) and args.fp16) == config.apply_query_key_layer_scaling
+                ), "Unsupported config for apply_query_key_layer_scaling in TransformerEngine."
                 return transformer_engine.pytorch.TransformerLayer(
                     config.hidden_size,
                     config.ffn_hidden_size,
@@ -1515,8 +1560,6 @@ class ParallelTransformer(MegatronModule):
                     tp_group=mpu.get_tensor_model_parallel_group(),
                     get_rng_state_tracker=tensor_parallel.get_cuda_rng_tracker,
                     fuse_wgrad_accumulation=config.gradient_accumulation_fusion,
-                    apply_query_key_layer_scaling=config.apply_query_key_layer_scaling,
-                    attention_softmax_in_fp32=config.attention_softmax_in_fp32,
                     seq_length=args.seq_length,
                     micro_batch_size=args.micro_batch_size,
                     sequence_parallel=config.sequence_parallel,
@@ -1801,7 +1844,253 @@ class ParallelTransformer(MegatronModule):
         # Handle renaming layernorm -> norm in component names
         state_dict_ = {}
         for key in state_dict.keys():
+            # Bypass TransformerEngine module parameters.
+            if "layernorm_qkv" in key or "layernorm_mlp" in key:
+                state_dict_[key] = state_dict[key]
+                continue
             newkey = key.replace("layernorm", "norm")
             state_dict_[newkey] = state_dict[key]
 
         super().load_state_dict(state_dict_, strict)
+
+from typing import Any, Tuple
+from torch import Tensor
+from torch.nn import Module
+import torch.distributed as dist
+
+# --------- ulysses --------------
+
+def post_all2all(scatter_idx, batch_dim_idx, seq_world_size, bs, seq_len, num_head, head_dim):
+
+    def post_func(input):
+        if batch_dim_idx == 0:
+            # b, s, n, h
+            if scatter_idx < 2:
+                output = input.permute(1, 2, 0, 3, 4).contiguous()
+                output = output.reshape(bs, seq_len // seq_world_size, seq_world_size * num_head,
+                                        head_dim).contiguous()
+            else:
+                output = input.permute(1, 0, 2, 3, 4).contiguous()
+                output = output.reshape(bs, seq_world_size * seq_len, num_head // seq_world_size,
+                                        head_dim).contiguous()
+        else:
+            # s, b, n, h
+            if scatter_idx < 2:
+                output = input.transpose(0, 1).transpose(1, 2).contiguous()
+                # output = input.permute(1, 2, 0, 3, 4).contiguous()
+                output = output.reshape(seq_len // seq_world_size, bs, seq_world_size * num_head,
+                                        head_dim).contiguous()
+            else:
+                output = input.reshape(seq_len * seq_world_size, bs, num_head // seq_world_size, head_dim).contiguous()
+        return output
+
+    return post_func
+
+def single_all_to_all(input, scatter_idx, gather_idx, batch_dim_idx, group, async_op=False, handle=None, type=None):
+    seq_world_size = dist.get_world_size(group)
+    if batch_dim_idx == 0:
+        # b, s, n, h
+        if scatter_idx < 2:
+            bs, global_seq_len, num_local_head, head_dim = input.shape
+            input_t = input.reshape([bs, seq_world_size, global_seq_len // seq_world_size, num_local_head,
+                                     head_dim]).contiguous()
+            input_t = input_t.permute(1, 0, 2, 3, 4).contiguous()
+        else:
+            bs, local_seq_len, num_total_head, head_dim = input.shape
+            assert num_total_head % seq_world_size == 0, f"Number of heads ({num_total_head}) must be divisible by the sequence parallel size ({seq_world_size})!"
+            input_t = input.reshape([bs, local_seq_len, seq_world_size, num_total_head // seq_world_size,
+                                     head_dim]).contiguous()
+            input_t = input_t.permute(2, 0, 1, 3, 4).contiguous()
+    else:
+        # s, b, n, h
+        if scatter_idx < 2:
+            global_seq_len, bs, num_local_head, head_dim = input.shape
+            input_t = input.reshape([seq_world_size, global_seq_len // seq_world_size, bs, num_local_head,
+                                     head_dim]).contiguous()
+        else:
+            local_seq_len, bs, num_total_head, head_dim = input.shape
+            assert num_total_head % seq_world_size == 0, f"Number of heads ({num_total_head}) must be divisible by the sequence parallel size ({seq_world_size})!"
+            input_t = input.reshape([local_seq_len * bs, seq_world_size, num_total_head // seq_world_size,
+                                     head_dim]).contiguous()
+            input_t = input_t.transpose(0, 1).contiguous()
+            # input_t = input.reshape([local_seq_len, bs, seq_world_size, num_total_head // seq_world_size,
+            #                          head_dim]).contiguous()
+            # input_t = input_t.permute(2, 0, 1, 3, 4).contiguous()
+
+    if scatter_idx < 2:
+        post_all2all_fun = post_all2all(scatter_idx, batch_dim_idx, seq_world_size, bs, global_seq_len, num_local_head,
+                                        head_dim)
+    else:
+        post_all2all_fun = post_all2all(scatter_idx, batch_dim_idx, seq_world_size, bs, local_seq_len, num_total_head,
+                                        head_dim)
+
+    output = torch.empty_like(input_t)
+    work = dist.all_to_all_single(output, input_t, group=group, async_op=async_op)
+
+    if async_op:
+        if type in ('dq', 'dk'):
+            handle[type + '_work'] = work
+            handle[type + '_grad'] = output
+            handle[type + '_post_all2all_func'] = post_all2all_fun
+            return output
+
+    res = post_all2all_fun(output)
+    return res
+
+class _SeqAllToAll(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx: Any,
+                group: dist.ProcessGroup,
+                input: Tensor,
+                scatter_idx: int,
+                gather_idx: int,
+                batch_dim_idx: int,
+                stream=None,
+                handle=None,
+                type=None,
+                is_fwd=True) -> Tensor:
+        ctx.group = group
+        ctx.scatter_idx = scatter_idx
+        ctx.gather_idx = gather_idx
+        ctx.stream = stream
+        ctx.handle = handle
+        ctx.type = type
+        ctx.batch_dim_idx = batch_dim_idx
+        if ctx.handle is None:
+            res = single_all_to_all(input, scatter_idx, gather_idx, batch_dim_idx, group, False)
+
+        else:
+            # overlap communication path
+            if not is_fwd and type == 'o':
+                assert ctx.stream != None
+                res = single_all_to_all(input, scatter_idx, gather_idx, batch_dim_idx, group, False)
+                get_accelerator().current_stream().wait_stream(ctx.stream)
+                del ctx.stream.activation_buffer_list
+                # The computation of d o_weight can overlap with the communication of d o_input
+
+            elif not is_fwd and type in ('q', 'k'):
+                # Achieve communication overlap by pipelining the matrix computation and communication of dq, dk, and dv
+                type = 'd' + type
+                res = single_all_to_all(input, scatter_idx, gather_idx, batch_dim_idx, group, True, handle, type)
+
+            elif is_fwd and type in ('q', 'k'):
+                # Achieve communication overlap by pipelining the matrix computation and communication of q, k, and v
+                type = 'fwd_' + type
+                res = single_all_to_all(input, scatter_idx, gather_idx, batch_dim_idx, group, False, handle, type)
+
+            else:
+                res = single_all_to_all(input, scatter_idx, gather_idx, batch_dim_idx, group, False)
+
+        return res
+
+    @staticmethod
+    def backward(ctx: Any, *grad_output: Tensor) -> Tuple[None, Tensor, None, None]:
+
+        return (None,
+                _SeqAllToAll.apply(ctx.group, *grad_output, ctx.gather_idx, ctx.scatter_idx, ctx.batch_dim_idx,
+                                   ctx.stream, ctx.handle, ctx.type, False), None, None, None, None, None, None, None)
+
+
+class DistributedAttention(torch.nn.Module):
+    """Initialization.
+
+    Arguments:
+        local_attention (Module): local attention with q,k,v
+        sequence_process_group (ProcessGroup): sequence parallel process group
+        scatter_idx (int): scatter_idx for all2all comm
+        gather_idx (int): gather_idx for all2all comm
+    """
+
+    def __init__(
+        self,
+        local_attention: Module,
+        sequence_process_group: dist.ProcessGroup,
+        scatter_idx: int = 2,
+        gather_idx: int = 0,
+        sp_stream=None,
+    ) -> None:
+
+        super(DistributedAttention, self).__init__()
+        self.local_attn = local_attention
+        self.spg = sequence_process_group
+        self.scatter_idx = scatter_idx
+        self.gather_idx = gather_idx
+        self.sp_overlap_comm = False
+        self.overlap_handles = None
+        self.sp_stream = sp_stream
+        if sp_stream is not None:
+            self.overlap_handles = {}
+            self.sp_overlap_comm = True
+            self.dafult_stream = get_accelerator().default_stream()
+
+    def layer_sync(self, layer):
+        if self.sp_overlap_comm and hasattr(layer, 'done_event'):
+            self.dafult_stream.wait_event(layer.done_event)
+
+    def forward(self, query: Tensor, key: Tensor, value: Tensor, batch_dim_idx: int, *args: Any, **kwargs) -> Tensor:
+        """ forward
+
+        Arguments:
+            query (Tensor): query input to the layer
+            key (Tensor): key input to the layer
+            value (Tensor): value input to the layer
+            batch_dim_idx (int): indicating which dim is batch
+            args: other args
+
+        Returns:
+            * output (Tensor): context output
+        """
+
+        # TODO Merge three alltoall calls into one
+        # TODO (Reza): change the api on the megatron-deepspeed side so that we only receive all data (q,k, and v) together!
+        #in shape : e.g.,  [s/p:h:]
+
+        def bwd_hook(layer_type):
+
+            def pre_hook_fun(grad):
+                type = 'd' + layer_type
+                self.overlap_handles[type + '_work'].wait()
+                self.sp_stream.wait_stream(self.dafult_stream)
+                all2all_output = self.overlap_handles[type + '_grad']
+                grad = list(grad)
+                grad[0] = self.overlap_handles[type + '_post_all2all_func'](all2all_output)
+                grad = tuple(grad)
+
+            return pre_hook_fun
+        if torch.distributed.get_world_size(self.spg) > 1:
+            self.layer_sync(query)
+            query_layer = _SeqAllToAll.apply(self.spg, query, self.scatter_idx, self.gather_idx, batch_dim_idx, None,
+                                            self.overlap_handles, 'q')
+            self.layer_sync(key)
+            key_layer = _SeqAllToAll.apply(self.spg, key, self.scatter_idx, self.gather_idx, batch_dim_idx, None,
+                                        self.overlap_handles, 'k')
+            if self.sp_overlap_comm:
+                self.dafult_stream.wait_stream(self.sp_stream)
+            value_layer = _SeqAllToAll.apply(self.spg, value, self.scatter_idx, self.gather_idx, batch_dim_idx, None,
+                                            self.overlap_handles, 'v')
+            if self.sp_overlap_comm:
+                # Register a hook to synchronize dq and dk after the all-to-all
+                # operation when the gradient data is used.
+                # Place this logic after the q, k, v all-to-all operation to
+                # improve interpreter speed to
+                # call and launch of the forward all-to-all communication.
+                grad_fn_q = query.grad_fn.next_functions[0][0]
+                grad_fn_q.register_prehook(bwd_hook(layer_type='q'))
+                grad_fn_k = key.grad_fn.next_functions[0][0]
+                grad_fn_k.register_prehook(bwd_hook(layer_type='k'))
+        else:
+            query_layer, key_layer, value_layer = query, key, value
+
+        #out shape : e.g., [s:h/p:]
+        head_dim = query_layer.shape[-1]
+        context_layer = self.local_attn(query_layer, key_layer, value_layer, *args, **kwargs)
+        context_layer = context_layer.view(context_layer.shape[0],context_layer.shape[1], -1, head_dim)
+        if torch.distributed.get_world_size(self.spg) > 1:
+            output = _SeqAllToAll.apply(self.spg, context_layer, self.gather_idx, self.scatter_idx, batch_dim_idx,
+                                        self.sp_stream, self.overlap_handles, 'o')
+        else:
+            output = context_layer
+        #out e.g., [s/p::h]
+        return output
+    

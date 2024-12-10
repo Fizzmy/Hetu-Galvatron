@@ -10,7 +10,7 @@ LAUNCHER="${LAUNCHER} --nnodes ${NUM_NODES}"
 LAUNCHER="${LAUNCHER} --nproc_per_node ${NUM_GPUS_PER_NODE}"
 
 export PROFILE_LAUNCHER="$LAUNCHER"
-export PROFILE_TRAINER="train_dist.py"
+export PROFILE_TRAINER="train_dist_test.py"
 
 MODEL_ARGS_SIZE15B="
     --model_size gpt-1.5b \
@@ -37,15 +37,19 @@ MODEL_ARGS_SIZE67B="
     --seq_length 2048"
 
 PROFILE_ARGS_BF16="
+    --profile_mode sequence \
     --profile_type memory \
     --profile_batch_size 8 \
+    --profile_min_seq_length 512 \
+    --profile_max_seq_length 8192 \
     --layernum_min 1 \
     --layernum_max 2 \
     --max_tp_deg 8 \
     --profile_dp_type zero3 \
     --mixed_precision bf16 \
+    --sequence_parallel \
     --use-flash-attn"
 
-python3 profiler.py ${MODEL_ARGS_SIZE15B} ${PROFILE_ARGS_BF16}
-# python3 profile.py ${MODEL_ARGS_SIZE27B} ${PROFILE_ARGS_BF16}
-# python3 profile.py ${MODEL_ARGS_SIZE67B} ${PROFILE_ARGS_BF16}
+# python3 profiler.py ${MODEL_ARGS_SIZE15B} ${PROFILE_ARGS_BF16}
+# python3 profiler.py ${MODEL_ARGS_SIZE27B} ${PROFILE_ARGS_BF16}
+python3 profiler.py ${MODEL_ARGS_SIZE67B} ${PROFILE_ARGS_BF16}

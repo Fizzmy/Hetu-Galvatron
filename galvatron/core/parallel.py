@@ -1,4 +1,6 @@
+import torch.distributed
 from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import ShardingStrategy, CPUOffload, MixedPrecision, BackwardPrefetch
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper, CheckpointImpl
@@ -8,8 +10,40 @@ import torch
 from typing import Tuple, List
 from functools import partial
 from galvatron.core.redistribute import fused_split_allgather
+from .utils import rgetattr, rsetattr, rhasattr
 
-def wrap_data_parallel(module, dp_type = None, dp_group = None, module_type='bert_enc', pp_device = None, mixed_precision=torch.bfloat16, pp_on=False, wrap_block_name=None):
+from torch.distributed.fsdp._common_utils import _get_module_fsdp_state
+import collections
+from typing import (
+    List,
+    Set,
+)
+
+def _get_modules_to_materialize(root_module: nn.Module) -> List[nn.Module]:
+    # Run BFS to collect the modules to materialize via `reset_parameters()`,
+    # stopping at any module with FSDP already applied
+    module_names_to_materialize: List[nn.Module] = []
+    modules_to_materialize: List[nn.Module] = []
+    queue = collections.deque([("",root_module)])
+    visited_modules: Set[nn.Module] = {root_module}
+    while queue:
+        name, module = queue.popleft()
+        module_names_to_materialize.append(name)
+        modules_to_materialize.append(module)
+        for child_name, child_module in module.named_children():
+            if (
+                child_module not in visited_modules
+                and _get_module_fsdp_state(child_module) is None
+            ):
+                visited_modules.add(child_module)
+                if name == "":
+                    queue.append((child_name, child_module))
+                else:
+                    queue.append((name+"."+child_name, child_module))
+
+    return module_names_to_materialize, modules_to_materialize
+
+def wrap_data_parallel(module, dp_type = None, dp_group = None, module_type='bert_enc', pp_device = None, mixed_precision=torch.bfloat16, pp_on=False, wrap_block_name=None, wrap_other_block_name=None, tp_groups=None, all_block_name=None, load_module_func=None):
     if dp_type is None:
         return module
     else:
@@ -17,15 +51,22 @@ def wrap_data_parallel(module, dp_type = None, dp_group = None, module_type='ber
         from .arguments import get_args
         fsdp_type_dict = {0:get_args().default_dp_type, 1:'zero3'}
         assert dp_type in fsdp_type_dict.keys()
-        return wrap_module_fsdp_manually(module, pp_device, module_type, dp_group, fsdp_type=fsdp_type_dict[dp_type], mixed_precision=mixed_precision, pp_on=pp_on, wrap_block_name=wrap_block_name)
+        return wrap_module_fsdp_manually(module, pp_device, module_type, dp_group, fsdp_type=fsdp_type_dict[dp_type], mixed_precision=mixed_precision, pp_on=pp_on, wrap_block_name=wrap_block_name, wrap_other_block_name=wrap_other_block_name, tp_groups=tp_groups, all_block_name=all_block_name, load_module_func=load_module_func)
 
-def param_init_fn(module):
-    module.to_empty(device=torch.device("cuda"))
-    for m in module.modules():
-        if callable(getattr(m, 'reset_parameters', None)):
-            m.reset_parameters()
+def param_init_fn(all_block_name, load, tp_groups, load_module_func, module):
+    m = module
+    if isinstance(m, tuple(all_block_name)):
+        m.to_empty(device=torch.device("cuda"))
+        module_names_to_materialize, modules_to_materialize = _get_modules_to_materialize(m)
+        for name, submodule in zip(module_names_to_materialize, modules_to_materialize):
+            if callable(getattr(submodule, 'reset_parameters', None)):
+                if load == None:
+                    submodule.reset_parameters()
+                else:
+                    load_module_func(load, tp_groups, name, submodule, m)
+    
 
-def wrap_module_fsdp_manually(module, pp_device, module_type='bert_enc', dp_group=None, fsdp_type='zero3', mixed_precision=torch.bfloat16, pp_on=False, wrap_block_name=None):
+def wrap_module_fsdp_manually(module, pp_device, module_type='bert_enc', dp_group=None, fsdp_type='zero3', mixed_precision=torch.bfloat16, pp_on=False, wrap_block_name=None, wrap_other_block_name=None, tp_groups=None, all_block_name=None, load_module_func=None):
     comm_group = None if dp_group is None else dp_group.group
     sharding_strategy = {'ddp': ShardingStrategy.NO_SHARD,
                            'zero2': ShardingStrategy.SHARD_GRAD_OP,
@@ -43,21 +84,29 @@ def wrap_module_fsdp_manually(module, pp_device, module_type='bert_enc', dp_grou
     fsdp_args = dict(process_group = comm_group, 
                     sharding_strategy = sharding_strategy, 
                     mixed_precision=mixed_precision_policy, 
-                    backward_prefetch=backward_prefetch,
+                    # backward_prefetch=backward_prefetch,
                     device_id=pp_device,
-                    param_init_fn=param_init_fn if 'initialize_on_meta' in args and args.initialize_on_meta else None,
+                    param_init_fn=partial(param_init_fn, all_block_name, args.load, tp_groups.group, load_module_func) if 'initialize_on_meta' in args and args.initialize_on_meta else None,
                     limit_all_gathers=True)
-
     # Wrap given block
     if wrap_block_name is not None:
         if 'enc' in module_type or 'dec' in module_type:
             module = apply_fsdp(module, fsdp_args, wrap_block_name)
-        else: 
-            # return module
-            if 'initialize_on_meta' in args and args.initialize_on_meta:
-                module = FSDP(module, **fsdp_args)
-            else:
-                module = FSDP(module.to(pp_device), **fsdp_args)
+        else:
+            module = apply_fsdp(module, fsdp_args, wrap_other_block_name)
+            # if not ('initialize_on_meta' in args and args.initialize_on_meta):
+            #     module = module.to(pp_device)
+
+            # if tied_wte_attr_names is not None:
+            #     if module_type == 'embed':
+            #         assert rhasattr(module.module, tied_wte_attr_names[0])
+            #         tied_module = rgetattr(module.module, tied_wte_attr_names[0])
+            #         rsetattr(module.module, tied_wte_attr_names[0], FSDP(tied_module, **fsdp_args))
+            #     elif module_type == 'cls':
+            #         assert rhasattr(module.module, tied_wte_attr_names[-1])
+            #         tied_module = rgetattr(module.module, tied_wte_attr_names[-1])
+            #         rsetattr(module.module, tied_wte_attr_names[-1], FSDP(tied_module, **fsdp_args))
+            # module = FSDP(module, **fsdp_args)
         return module
 
     # Wrap manually
@@ -159,30 +208,44 @@ class Module_with_relocation(nn.Module):
         if hasattr(module, 'get_extended_attention_mask'):
             self.get_extended_attention_mask = module.get_extended_attention_mask
 
-    def forward(self, *inputs):
+    def forward(self, *inputs, **kwargs):
         if isinstance(inputs, (Tuple, List)):
             inputs_relocated = []
             inputs_relocated.append(self.relocate_activations(inputs[0], True))
             for input in inputs[1:]:
                 inputs_relocated.append(self.relocate_activations(input, False))
             inputs_relocated = tuple(inputs_relocated)
-            return self.module(*inputs_relocated)
+            return self.module(*inputs_relocated, **kwargs)
         else:
             input_relocated = self.relocate_activations(inputs)
-            return self.module(input_relocated)
+            return self.module(input_relocated, **kwargs)
 
-def wrap_modules_data_parallel(module_list, dp_types, dp_groups, module_types, pp_devices=None, mixed_precision=torch.bfloat16, default_process_group=None, wrap_block_name=None):
+def wrap_modules_data_parallel(module_list, dp_types, dp_groups, module_types, pp_devices=None, mixed_precision=torch.bfloat16, default_process_group=None, wrap_block_name=None, wrap_other_block_name=None, tp_groups=None, all_block_name=None, load_module_func=None):
     assert len(module_list) == len(dp_types)
     assert len(module_list) == len(dp_groups)
     
     process_group = default_process_group if default_process_group is not None else dp_groups[0]
-    pp_on = True if process_group.size < torch.distributed.get_world_size() else False
+    from .arguments import get_args
+    args = get_args()
+    pp_on = True if args.pp_deg > 1 else False
+    # pp_on = True if process_group.size < torch.distributed.get_world_size() else False
     
     if pp_devices is not None:
         assert len(pp_devices) == len(module_list)
     for i in range(len(module_list)):
         pp_device = None if pp_devices is None else pp_devices[i]
-        module_list[i] = wrap_data_parallel(module_list[i], dp_types[i], dp_groups[i], module_type=module_types[i], pp_device = pp_device, mixed_precision=mixed_precision, pp_on=pp_on, wrap_block_name=wrap_block_name)
+        module_list[i] = wrap_data_parallel(
+            module_list[i], dp_types[i], dp_groups[i],
+            module_type=module_types[i],
+            pp_device = pp_device,
+            mixed_precision=mixed_precision,
+            pp_on=pp_on,
+            wrap_block_name=wrap_block_name,
+            wrap_other_block_name=wrap_other_block_name,
+            tp_groups=tp_groups[i],
+            all_block_name=all_block_name,
+            load_module_func=load_module_func
+        )
     from .arguments import get_args
     args = get_args()
     sharding_strategy = {'ddp': ShardingStrategy.NO_SHARD,
@@ -199,9 +262,9 @@ def wrap_modules_data_parallel(module_list, dp_types, dp_groups, module_types, p
     fsdp_args = dict(process_group=process_group.group,
                     sharding_strategy=sharding_strategy, 
                     mixed_precision=mixed_precision_policy, 
-                    backward_prefetch=backward_prefetch,
+                    # backward_prefetch=backward_prefetch,
                     device_id=pp_devices[0],
-                    param_init_fn=param_init_fn if 'initialize_on_meta' in args and args.initialize_on_meta else None,
+                    param_init_fn=partial(param_init_fn, all_block_name, args.load, None, None) if 'initialize_on_meta' in args and args.initialize_on_meta else None,
                     limit_all_gathers=True)
     module_list = FSDP(module_list, **fsdp_args)
     return module_list
@@ -222,7 +285,7 @@ def wrap_model_data_parallel(model, device, wrap_block_names=[], dp_type='ddp', 
     fsdp_args = dict(process_group = comm_group, 
                     sharding_strategy = sharding_strategy, 
                     mixed_precision=mixed_precision_policy, 
-                    backward_prefetch=backward_prefetch,
+                    # backward_prefetch=backward_prefetch,
                     device_id=device,
                     param_init_fn=param_init_fn if initialize_on_meta else None,
                     limit_all_gathers=True)

@@ -51,7 +51,10 @@ _deps = [
     "attrs>=21.4.0",
     "yacs>=0.1.8",
     "six>=1.15.0",
-    "sentencepiece>=0.1.95"
+    "sentencepiece>=0.1.95",
+    "pybind11>=2.9.1",
+    "scipy>=1.10.1",
+
 ]
 
 if FLASH_ATTN_INSTALL:
@@ -64,8 +67,8 @@ setup(
     description="Galvatron, a Efficient Transformer Training Framework for Multiple GPUs Using Automatic Parallelism",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
-    author="Yujie Wang, Shenhan Zhu",
-    author_email="alfredwang@pku.edu.cn, shenhan.zhu@pku.edu.cn",
+    author="Yujie Wang, Shenhan Zhu, Xinyi Liu",
+    author_email="alfredwang@pku.edu.cn, shenhan.zhu@pku.edu.cn, xy.liu@stu.pku.edu.cn",
     packages=find_packages(
         exclude=(
             "build",
