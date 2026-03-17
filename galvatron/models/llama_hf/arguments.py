@@ -24,9 +24,12 @@ def model_args(parser):
         default=12,
         help="Number of attention heads",
     )
-    group.add_argument("--ffn_hidden_size", type=int, default=3072, help="Size of the feed-forward hidden dimension in the transformer")
+    group.add_argument("--intermediate_size", type=int, default=3072, help="Size of the feed-forward hidden dimension in the transformer")
     group.add_argument("-s", "--seq_length", type=int, default=128, help="Maximum sequence len")
     group.add_argument("--vocab_size", type=int, default=30522, help="Total number of vocab")
+    group.add_argument("--rms_norm_eps", type=float, default=1e-5, help="Epsilon for the RMS normalization")
+    group.add_argument("--rope_theta", type=float, default=1000000.0, help="Rope theta")
+    group.add_argument("--num_key_value_heads", type=int, default=8, help="Number of key value heads")
     group.add_argument("--max_predictions_per_seq", type=int, default=20)
     return parser
 

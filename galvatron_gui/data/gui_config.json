@@ -1,0 +1,11 @@
+{
+  "datasets": [
+    "/home/pkuhetu/lxy/dataset"
+  ],
+  "tokenizers": [
+    "/home/pkuhetu/lxy/Llama-2-7b-hf"
+  ],
+  "ray_env_vars": {
+    "NCCL_IB_HCA": "mlx5_2,mlx5_5"
+  }
+}

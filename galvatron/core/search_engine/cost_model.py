@@ -224,7 +224,7 @@ class TimeCostModel:
         'TrainArgs':['mixed_precision', 'async_grad_reduce'],
         'ParallelArgs':['sp_space', 'optimal_chunk_func'],
         'ProfileModelArgs': ['forward_computation_time'],
-        'ProfileHardwareArgs':['bct_fct_coe', 'extra_overhead', 'comm_coe_dict', 'dp_overlap_coe', 'bct_overlap_coe', 'p2p_comm_coe_dict', 'costmodel_coe', 'allreduce_dict', 'all2all_dict']
+        'ProfileHardwareArgs':['bct_fct_coe', 'extra_overhead', 'comm_coe_dict', 'dp_overlap_coe', 'bct_overlap_coe', 'p2p_comm_coe_dict', 'costmodel_coe', 'allreduce_dict', 'all2all_dict', 'all2all_comm_coe']
     }
     
     def __init__(self, 
@@ -274,16 +274,28 @@ class TimeCostModel:
         self.checkpoint = True if 'cpt' in args.strategy[-1].keys() and args.strategy[-1]['cpt'] else False
         if 'sp' in args.strategy[-1].keys() and args.strategy[-1]['sp'] == 1:
             self.sdp_size = self.tp_size * self.dp_size
-            if self.tp_size == 1:
-                self.sp_dict = np.inf
+            if args.all2all_dict is not None:
+                if self.tp_size == 1:
+                    self.sp_dict = np.inf
+                else:
+                    self.sp_dict = args.all2all_dict[self.tp_size]
             else:
-                self.sp_dict = args.all2all_dict[self.tp_size]
+                self.sp_dict = None
+            if args.all2all_comm_coe is not None:
+                self.tp_comm_coe = args.all2all_comm_coe['%d'%self.tp_size] if '%d'%self.tp_size in args.all2all_comm_coe.keys() else args.all2all_comm_coe['%d_1'%self.tp_size]
+                self.tp_comm_coe /= 2 # Scaling with allreduce bus bandwidth
         else:
             self.sdp_size = self.dp_size
-            if self.tp_size == 1:
-                self.sp_dict = np.inf
+            if args.allreduce_dict is not None:
+                if self.tp_size == 1:
+                    self.sp_dict = np.inf
+                else:
+                    self.sp_dict = args.allreduce_dict[self.tp_size]
             else:
-                self.sp_dict = args.allreduce_dict[self.tp_size]
+                self.sp_dict = None
+        
+            self.tp_comm_coe = args.comm_coe_dict['%d'%self.tp_size] if '%d'%self.tp_size in args.comm_coe_dict.keys() else args.comm_coe_dict['%d_1'%self.tp_size]
+
                 
         # [initialize]:copy some attributes and initialize local batch size, optimal_microbatch, parameter_size
         self.seq_len = args.seq_length
@@ -344,7 +356,7 @@ class TimeCostModel:
     
     def estimate_tp_communication_cost(self):
         args = self.args
-        if self.sp_space == 'tp+sp':
+        if self.sp_space == 'tp+sp' and self.sp_dict is not None:
             # [calculate]:calculate tp comm time
             self.tp_comm_num = 4 * self.layer_num
             if self.checkpoint:
@@ -366,41 +378,15 @@ class TimeCostModel:
             self.tp_communication_time = self.tp_comm_num * per_tp_message_time
         else:
             # [calculate]:calculate tp message size of whole model (depending on dummy layer_num)
-            tp_comm_times = 4 
+            tp_comm_times = 4 # forward 2 + backward 2 (allreduce)
             self.tp_message_size = 2 * (self.tp_size - 1) / self.tp_size * (self.bsz * self.seq_len * self.hidden_size * tp_comm_times * 4 / 1024 / 1024) * self.layer_num
             if self.checkpoint:
                 self.tp_message_size *= 1.5
             if args.mixed_precision:
                 self.tp_message_size /= 2
-            
-            # [calculate]:calculate tc
-            if 'sp' in args.strategy[-1].keys() and args.strategy[-1]['sp'] == 1:
-                if self.tp_size == 1 or self.dp_size == 1:
-                    tc = args.comm_coe_dict['%d'%self.tp_size] if '%d'%self.tp_size in args.comm_coe_dict.keys() else args.comm_coe_dict['%d_1'%self.tp_size]
-                else:
-                    # In this case, strategy[-1]['tp'] represents tp_consecutive_flag
-                    info = args.strategy[-1]
-                    assert 'tp' in info.keys() and info['tp'] in [0, 1]
-                    tp_consecutive_flag = info['tp']
-                    if tp_consecutive_flag:
-                        tc = args.comm_coe_dict['%d_1'%self.tp_size]
-                    else:
-                        tc = args.comm_coe_dict['%d_0'%self.tp_size]
-            else:
-                if self.tp_size == 1 or self.dp_size == 1:
-                    tc = args.comm_coe_dict['%d'%self.tp_size] if '%d'%self.tp_size in args.comm_coe_dict.keys() else args.comm_coe_dict['%d_1'%self.tp_size]
-                else:
-                    # In this case, strategy[-1]['tp'] represents tp_consecutive_flag
-                    info = args.strategy[-1]
-                    assert 'tp' in info.keys() and info['tp'] in [0, 1]
-                    tp_consecutive_flag = info['tp']
-                    if tp_consecutive_flag:
-                        tc = args.comm_coe_dict['%d_1'%self.tp_size]
-                    else:
-                        tc = args.comm_coe_dict['%d_0'%self.tp_size]  
                                       
             # [calculate]:calculate tp time
-            self.tp_communication_time = self.tp_message_size * tc
+            self.tp_communication_time = self.tp_message_size * self.tp_comm_coe
   
     def estimate_pp_communication_cost(self):
         args = self.args
@@ -540,7 +526,7 @@ class OtherTimeCostModel:
             self.tp_message_size = []
             for seq_len in self.sequence_length_list:
                 if args.vsp == 0:
-                    if self.sp_space == 'tp+sp':
+                    if self.sp_space == 'tp+sp'  and args.allreduce_dict is not None:
                         self.per_tp_message_size.append(args.mbsz * seq_len * args.hidden_size * (2 if args.mixed_precision else 4))
                         if k == 1:
                             self.per_tp_message_time.append(0)

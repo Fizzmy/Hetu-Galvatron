@@ -34,7 +34,7 @@ PROFILE_ARGS="
     --mixed_precision bf16 \
     --use-flash-attn \
     --sequence_parallel \
-    --profile_flow_control all \
+    --profile_flow_control scripts_only \
     --profile_unit all"
 
 # PROFILE_ARGS="

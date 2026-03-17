@@ -1,4 +1,5 @@
 import time
+import os
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -17,12 +18,14 @@ class RuntimeProfiler(BaseProfiler):
             args: Arguments containing profiling configuration
         """
         super().__init__(args)
+        self.profiling_complete = False  # Flag to indicate profiling is complete (for return_result mode)
 
     def set_profiler_dist(
         self,
         path: Optional[str] = None,
         model_layer_configs: Optional[List[Dict]] = None,
         model_name: Optional[str] = None,
+        result: Optional[Dict] = None,
         profile_ranks: Optional[List[int]] = None,
         start_iter: int = 10,
         end_iter: int = 20,
@@ -51,7 +54,7 @@ class RuntimeProfiler(BaseProfiler):
         self.set_model_name(model_name)
         self.set_model_layer_configs(model_layer_configs)
         self.set_memory_profiler(rank, profile_ranks)
-
+        self.result = result
         exit_ = self.args.exit_after_profiling if hasattr(self.args, "exit_after_profiling") else True
         self.set_time_profiler(start_iter=start_iter, end_iter=end_iter, exit=exit_)
 
@@ -109,6 +112,8 @@ class RuntimeProfiler(BaseProfiler):
 
         if args.profile and rank in profile_ranks and iter <= max_profile_iter:
             local_rank = args.local_rank if hasattr(args, "local_rank") else 0
+            if os.getenv("LAUNCH_BACKEND") == "ray":
+                local_rank = 0
             profile_type = args.profile_type if hasattr(args, "profile_type") else "allocated"
 
             if stage == "Before Forward":
@@ -161,29 +166,38 @@ class RuntimeProfiler(BaseProfiler):
 
                 # Save results if requested
                 if hasattr(args, "save_profiled_memory") and args.save_profiled_memory:
-                    assert self.layernum_list is not None
-                    world_size = torch.distributed.get_world_size()
-                    memory_config_path = self.memory_profiling_path()
+                    if self.result is not None:
+                        self.result["data"] = {}
+                        self.result["data"][f"rank{rank}_ms"] = mem_dict["model_states"]
+                        self.result["data"][f"rank{rank}_act"] = mem_dict["activation"]
+                        self.result["data"][f"rank{rank}_act_peak"] = mem_dict["peak_activation"]
+                    else:
+                        assert self.layernum_list is not None
+                        world_size = torch.distributed.get_world_size()
+                        memory_config_path = self.memory_profiling_path()
 
-                    save_profiled_memory(
-                        memory_config_path,
-                        args.pp_deg,
-                        args.global_tp_deg,
-                        world_size,
-                        self.layernum_list,
-                        args.global_train_batch_size,
-                        rank,
-                        mem_dict["model_states"],
-                        mem_dict["activation"],
-                        mem_dict["peak_activation"],
-                        args.global_checkpoint,
-                        args.sequence_parallel,
-                        args.vocab_tp,
-                        self.seqlen_list,
-                    )
+                        save_profiled_memory(
+                            memory_config_path,
+                            args.pp_deg,
+                            args.global_tp_deg,
+                            world_size,
+                            self.layernum_list,
+                            args.global_train_batch_size,
+                            rank,
+                            mem_dict["model_states"],
+                            mem_dict["activation"],
+                            mem_dict["peak_activation"],
+                            args.global_checkpoint,
+                            args.sequence_parallel,
+                            args.vocab_tp,
+                            self.seqlen_list,
+                        )
 
             if hasattr(args, "save_profiled_memory") and args.save_profiled_memory:
-                exit(0)
+                if self.result is None:
+                    exit(0)
+                else:
+                    self.profiling_complete = True
 
     # =============== Time Profiling ===============
     def set_time_profiler(self, start_iter: int, end_iter: int, exit: bool = False) -> None:
@@ -267,14 +281,20 @@ class RuntimeProfiler(BaseProfiler):
 
             args = self.args
             if hasattr(args, "profile_forward") and args.profile_forward:
-                assert self.layernum_list is not None
-                time_config_path = self.time_profiling_path()
-                save_profiled_time(
-                    time_config_path, avg_time, args.global_train_batch_size, self.layernum_list, self.seqlen_list
-                )
+                if self.result is not None:
+                    self.result["data"] = avg_time
+                else:
+                    assert self.layernum_list is not None
+                    time_config_path = self.time_profiling_path()
+                    save_profiled_time(
+                        time_config_path, avg_time, args.global_train_batch_size, self.layernum_list, self.seqlen_list
+                    )
 
             if self.exit:
-                exit(0)
+                if self.result is None:
+                    exit(0)
+                else:
+                    self.profiling_complete = True
             else:
                 self.start_iter, self.end_iter = self.end_iter, (self.end_iter - self.start_iter + self.end_iter)
                 self.total_start_time = time.time()
@@ -286,14 +306,20 @@ class RuntimeProfiler(BaseProfiler):
 
         args = self.args
         if hasattr(args, "profile_forward") and args.profile_forward:
-            assert self.layernum_list is not None
-            time_config_path = self.time_profiling_path()
-            save_profiled_time(
-                time_config_path, avg_time * 1e3, args.global_train_batch_size, self.layernum_list, self.seqlen_list
-            )
+            if self.result is not None:
+                    self.result["data"] = avg_time
+            else:
+                assert self.layernum_list is not None
+                time_config_path = self.time_profiling_path()
+                save_profiled_time(
+                    time_config_path, avg_time * 1e3, args.global_train_batch_size, self.layernum_list, self.seqlen_list
+                )
 
         if self.exit:
-            exit(0)
+            if self.result is None:
+                exit(0)
+            else:
+                self.profiling_complete = True
         else:
             self.time_list = []
             self.start_iter, self.end_iter = self.end_iter, (self.end_iter - self.start_iter + self.end_iter)

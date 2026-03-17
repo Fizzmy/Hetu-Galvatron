@@ -1,0 +1,89 @@
+{
+  "pp4_ckpt0_layernum[4]_bsz8_seq8192": {
+    "rank0_ms": 2564.9072265625,
+    "rank0_act": 4628.25146484375,
+    "rank0_act_peak": 6346.50146484375,
+    "rank7_ms": 2564.9384765625,
+    "rank7_act": 6884.78369140625,
+    "rank7_act_peak": 8499.54833984375
+  },
+  "pp2_ckpt0_layernum[2]_bsz8_seq8192": {
+    "rank0_ms": 1296.5400390625,
+    "rank0_act": 2315.12646484375,
+    "rank0_act_peak": 3533.29052734375,
+    "rank7_ms": 1295.5556640625,
+    "rank7_act": 3442.39306640625,
+    "rank7_act_peak": 4372.79443359375
+  },
+  "pp1_ckpt1_layernum[1]_bsz8_seq8192": {
+    "rank0_ms": 906.36083984375,
+    "rank0_act": 692.0712890625,
+    "rank0_act_peak": 2000.1572265625,
+    "rank7_ms": 906.36083984375,
+    "rank7_act": 692.0712890625,
+    "rank7_act_peak": 2000.1572265625
+  },
+  "pp1_ckpt1_layernum[2]_bsz8_seq8192": {
+    "rank0_ms": 1296.400390625,
+    "rank0_act": 756.0712890625,
+    "rank0_act_peak": 2103.6865234375,
+    "rank7_ms": 1296.400390625,
+    "rank7_act": 756.0712890625,
+    "rank7_act_peak": 2103.6865234375
+  },
+  "pp1_ckpt0_layernum[1]_bsz8_seq8192": {
+    "rank0_ms": 906.36083984375,
+    "rank0_act": 1657.197265625,
+    "rank0_act_peak": 2185.82568359375,
+    "rank7_ms": 906.36083984375,
+    "rank7_act": 1657.197265625,
+    "rank7_act_peak": 2185.82568359375
+  },
+  "pp1_ckpt0_layernum[2]_bsz8_seq8192": {
+    "rank0_ms": 1296.400390625,
+    "rank0_act": 2686.3232421875,
+    "rank0_act_peak": 3118.44189453125,
+    "rank7_ms": 1296.400390625,
+    "rank7_act": 2686.3232421875,
+    "rank7_act_peak": 3118.44189453125
+  },
+  "layertype_0": {
+    "8192": {
+      "parameter_size": 780.0791015625,
+      "tp_activation_per_bsz_dict": {
+        "1": 1029.1259765625,
+        "checkpoint": 64.0
+      }
+    }
+  },
+  "other_memory_pp_off": {
+    "8192": {
+      "model_states": {
+        "1": 4130.5703125
+      },
+      "activation": {
+        "1": 1156.69970703125
+      }
+    }
+  },
+  "other_memory_pp_on_first": {
+    "8192": {
+      "model_states": {
+        "1": 2009.498046875
+      },
+      "activation": {
+        "1": 557.4993896484375
+      }
+    }
+  },
+  "other_memory_pp_on_last": {
+    "8192": {
+      "model_states": {
+        "1": 2009.560546875
+      },
+      "activation": {
+        "1": 1095.7611083984375
+      }
+    }
+  }
+}

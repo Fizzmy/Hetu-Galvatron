@@ -46,4 +46,5 @@ class ProfileHardwareArgs:
     p2p_comm_coe_dict: dict = field(default_factory=lambda: {2: 0.006787944610371979, 4: 0.0074923765069042254, 8: 0.00920674670398468})
     allreduce_dict: dict = field(default_factory=lambda: {})
     all2all_dict: dict = field(default_factory=lambda: {})
+    all2all_comm_coe: dict = field(default_factory=lambda: {})
     costmodel_coe: float = 1.0

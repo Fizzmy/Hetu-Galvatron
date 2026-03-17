@@ -3,7 +3,7 @@ export NUM_GPUS_PER_NODE=8
 export MASTER_ADDR=localhost
 export MASTER_PORT=$MASTER_PORT
 export NODE_RANK=0
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+# export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 # export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_IB_HCA=mlx5_2,mlx5_5
 LAUNCHER="python3 -m torch.distributed.launch"
@@ -21,17 +21,17 @@ TOKENIZER_MODEL=/home/pkuhetu/lxy/checkpoints/llama2-7b-chat-hf/tokenizer.model
 MODEL_ARGS="
     --model_size llama-7b \
     --set_model_config_manually 0 \
-    --set_layernum_manually 0 \
+    --set_layernum_manually 1 \
     --set_seqlen_manually 1 \
     --vocab_size 32000 \
     --hidden_size 4096 \
     --num_hidden_layers 8 \
     --num_attention_heads 32 \
-    --seq_length 2048"
+    --seq_length 4096"
 
 TRAIN_ARGS="
-    --global_train_batch_size 64 \
-    --train-iters 20 \
+    --global_train_batch_size 8 \
+    --train-iters 30 \
     --eval-iters 1 \
     --lr 1.25e-6 \
     --lr-decay-style cosine \
@@ -46,7 +46,6 @@ TRAIN_ARGS="
     --dropout_prob 0.1 \
     --check_loss 0 \
     --profile 1 \
-    --no_async_grad_reduce \
     --save_profiled_memory 0"
 
 DATA_ARGS="
@@ -73,13 +72,14 @@ CKPT_ARGS="
 
 PARALLEL_ARGS="
     --pp_deg 1 \
-    --global_tp_deg 4 \
+    --global_tp_deg 8 \
     --global_tp_consec 1 \
-    --global_cp_deg 2 \
-    --sdp 1 \
-    --global_checkpoint 1 \
-    --vocab_tp 4 \
-    --vocab_cp 2 \
+    --global_cp_deg 1 \
+    --sdp 0 \
+    --global_checkpoint 0 \
+    --vocab_tp 8 \
+    --vocab_cp 1 \
+    --embed_sdp 0 \
     --chunks 8 \
     --pipeline_type pipedream_flush \
     --default_dp_type zero2 \
@@ -87,6 +87,7 @@ PARALLEL_ARGS="
     --sequence-parallel \
     --use-flash-attn \
     --initialize_on_meta 1"
-    # --galvatron_config_path ./configs/galvatron_config_hidden4096_head32_1nodes_8gpus_per_node_36GB_bf16_[tpconsec_off].json"
+    # --galvatron_config_path /home/pkuhetu/lxy/Hetu-Galvatron/galvatron/models/llama_hf/configs/galvatron_config_llama-7b_1nodes_8gpus_per_node_30GB_bf16_[tpconsec_off].json"
+    # --galvatron_config_path /home/pkuhetu/lxy/Hetu-Galvatron/galvatron/models/llama_hf/configs/galvatron_config_llama-7b_1nodes_8gpus_per_node_36GB_bf16_[tpconsec_off].json"
 
 ${LAUNCHER} ${TRAINER} ${MODEL_ARGS} ${TRAIN_ARGS} ${PARALLEL_ARGS} ${DATA_ARGS} # ${CKPT_ARGS}

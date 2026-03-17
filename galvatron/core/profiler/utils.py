@@ -34,6 +34,7 @@ def save_profiled_memory(
     sequence_parallel=False,
     vocab_tp=1,
     seq=None,
+    result=None,
 ):
     config = read_json_config(path) if os.path.exists(path) else {}
     key = "%d_%d_%d" % (pp_deg, tp_deg, world_size // pp_deg // tp_deg)

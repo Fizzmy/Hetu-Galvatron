@@ -193,7 +193,7 @@ class Attention(MegatronModule, ABC):
                 local_attention = self.core_attention
             assert self.config.num_query_groups % sp_world_size == 0
             self.dist_attn = build_module(
-                submodules.dist_attn,
+                submodules.dist_attention,
                 local_attention=local_attention,
                 sequence_process_group=sp_group,
                 gather_idx=1 if self.use_flash_attn else 0,
@@ -725,12 +725,12 @@ class Attention(MegatronModule, ABC):
                             rearrange(x, "s b ... -> b s ...").contiguous() for x in (query, key, value)
                         ]
 
-                        context_layer = self.dist_attn(q, k, v, batch_dim_idx)
-                        context_layer = rearrange(context_layer, "b s h d -> s b (h d)").contiguous()
+                        core_attn_out = self.dist_attn(q, k, v, batch_dim_idx)
+                        core_attn_out = rearrange(core_attn_out, "b s h d -> s b (h d)").contiguous()
                     else:
                         batch_dim_idx = 1  # [S,B,H,D]
-                        context_layer = self.dist_attn(q, k, v, batch_dim_idx, attention_mask)
-                        context_layer = rearrange(context_layer, "... h d -> ... (h d)").contiguous()
+                        core_attn_out = self.dist_attn(q, k, v, batch_dim_idx, attention_mask)
+                        core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)").contiguous()
 
             else:
                 # Dynamic batching attention kernel.

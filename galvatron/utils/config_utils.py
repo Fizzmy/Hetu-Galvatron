@@ -13,7 +13,6 @@ def array2str(a):
     return ",".join(map(str,a))
 
 def read_json_config(path):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
     return json.load(open(path,'r',encoding="utf-8"))
 
 def write_json_config(config, path):
@@ -37,7 +36,10 @@ def config2strategy(config):
     else:
         vcp = 1
     tp_sizes_enc = str2array(config['tp_sizes_enc'])
-    cp_sizes_enc = str2array(config['cp_sizes_enc'])
+    if 'cp_sizes_enc' in config:
+        cp_sizes_enc = str2array(config['cp_sizes_enc'])
+    else:
+        cp_sizes_enc = [1 for _ in range(len(tp_sizes_enc))]
     tp_consecutive_flags = str2array(config['tp_consecutive_flags'])
     dp_types_enc = str2array(config['dp_types_enc'])
     if "use_sp" in config:
@@ -78,6 +80,20 @@ def read_allreduce_bandwidth_config(config_path, gpu_num):
         max_dp = max_dp // 2
     bandwidth_dict['1']=np.inf
     comm_coe_dict['1']=0
+    return bandwidth_dict, comm_coe_dict
+
+def read_all2all_bandwidth_config(config_path):
+    if isinstance(config_path, str):
+        env_config = read_json_config(config_path)
+    else:
+        env_config = config_path
+    bandwidth_dict = {}
+    comm_coe_dict = {}
+    for key, value in env_config.items():
+        if key.startswith('all2all_size_'):
+            size = key.replace('all2all_size_', '')
+            bandwidth_dict[size] = value
+            comm_coe_dict[size] = 1.0/value
     return bandwidth_dict, comm_coe_dict
 
 def read_p2p_bandwidth_config(config_path):

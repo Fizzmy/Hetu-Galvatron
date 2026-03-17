@@ -11,12 +11,21 @@ def write_json_config(config, path):
     with open(path,'w') as fp:
         json.dump(config,fp, indent=4)
 
-def profile(args):
+def profile(args, return_result=False):
     torch.distributed.init_process_group(backend="nccl")
-    local_rank = args.local_rank
+    
+    # Support both argparse and environment variables
+    if hasattr(args, "local_rank") and args.local_rank >= 0:
+        local_rank = args.local_rank
+    else:
+        local_rank = int(os.environ["LOCAL_RANK"])
     rank = torch.distributed.get_rank()
-    torch.cuda.set_device(local_rank)
-    device = torch.device("cuda", local_rank)
+    if not return_result:
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+    else:
+        torch.cuda.set_device(0)
+        device = torch.device("cuda", 0)
     world_size = torch.distributed.get_world_size()
 
     model = nn.Linear(4096, 4096, bias=False).cuda()
@@ -169,7 +178,7 @@ def profile(args):
 
     overlap_coe = max(comm_delay, compute_delay)
 
-    if local_rank == 0:
+    if not return_result and local_rank == 0:
         print('comm_times:', comm_time_list)
         print('compute_times:', compute_time_list)
         print('overlap_coe:', overlap_coe)
@@ -183,8 +192,41 @@ def profile(args):
         print('Overlap coefficient:', config[key])
         write_json_config(config, env_config_path)
         print('Already written overlap_coefficient into env config file %s!'%(env_config_path))
+    
     # cleanup, ref: https://pytorch.org/docs/stable/distributed.html#shutdown
     torch.distributed.destroy_process_group()
+    
+    if return_result:
+    # Return result for Ray integration
+        result = {
+            "rank": rank,
+            "local_rank": local_rank,
+            "data": {
+                f"{args.key}": float(overlap_coe),
+            },
+        }
+        return result
+
+def ray_profile_overlap(args):
+    """
+    Ray remote function wrapper with error handling
+    
+    Returns:
+        Dict with either success result or error information
+    """
+    try:
+        result = profile(args, return_result=True)
+        result["success"] = True
+        return result
+    except Exception as e:
+        import traceback
+        return {
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+            "rank": int(os.environ.get("RANK", -1)),
+            "local_rank": int(os.environ.get("LOCAL_RANK", -1))
+        }
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

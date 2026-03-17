@@ -47,7 +47,6 @@ def galvatron_training_args(parser, use_megatron=True):
         help="Galvatron profiling mode",
         choices=["static", "batch", "sequence"],
     )
-    group.add_argument("--load_params", type=int, default=0, help="Whether to load saved init params.")
     group.add_argument(
         "--pp_deg",
         type=int,
@@ -64,13 +63,6 @@ def galvatron_training_args(parser, use_megatron=True):
         choices=[1, 2, 4, 8, 16, 32], 
     )
     
-    group.add_argument(
-        "--cp_mode",
-        type=str,
-        default="zigzag", 
-        help="Context parallel communication mode.",
-        choices=["ring", "zigzag"], 
-    )
     group.add_argument(
         "--global_tp_deg",
         type=int,
@@ -244,4 +236,15 @@ def galvatron_training_args(parser, use_megatron=True):
         help="Profile granularity",
     )
 
+    return parser
+
+def galvatron_multimodal_args(parser):
+    group = parser.add_argument_group(title="Galvatron Multimodal Arguments")
+
+    group.add_argument(
+        "--multimodal_dataset_path",
+        type=str,
+        default=None,
+        help="Path to the multimodal dataset.",
+    )
     return parser

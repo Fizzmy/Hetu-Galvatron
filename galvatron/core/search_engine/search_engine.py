@@ -4,6 +4,7 @@ import logging
 import numpy as np
 from galvatron.utils import (
     read_allreduce_bandwidth_config, 
+    read_all2all_bandwidth_config,
     read_json_config, 
     read_p2p_bandwidth_config, 
     form_strategy, 
@@ -24,6 +25,8 @@ from .cost_model_args import ModelArgs, ParallelArgs, TrainArgs, ProfileModelArg
 class GalvatronSearchEngine():
     def __init__(self, args):
         self.args = args
+        if not hasattr(self.args, 'model_identifier'):
+            self.args.model_identifier = self.args.model_size
         args.gpu_num = args.num_nodes * args.num_gpus_per_node
         self.layernum_arg_names = None
         self.mem_path = None
@@ -40,6 +43,15 @@ class GalvatronSearchEngine():
         self.model_type = 'gpt'
         self.optimal_chunk_func = optimal_chunk_func_default
         self.memory_constraint = args.memory_constraint * 1024
+
+        self.allreduce_bandwidth = None
+        self.allreduce_comm_coe = None
+        self.p2p_bandwidth = None
+        self.overlap_coe = None
+        self.all2all_bandwidth = None
+        self.all2all_comm_coe = None
+        self.sp_allreduce = None
+        self.sp_all2all = None
         
     # =============== Setting Galvatron Search Engine Basic Information ===============
     def set_search_engine_info(self, path, model_layer_configs, model_name):
@@ -68,7 +80,10 @@ class GalvatronSearchEngine():
             memory_config_path = os.path.join(self.path, 'configs')
         else:
             memory_config_path = args.memory_profiling_path
-        self.mem_path = os.path.join(memory_config_path, memory_config_name)
+        if os.path.isdir(memory_config_path):
+            self.mem_path = os.path.join(memory_config_path, memory_config_name)
+        else:
+            self.mem_path = args.memory_config_path
         return self.mem_path
     
     def time_profiling_path(self):
@@ -78,11 +93,13 @@ class GalvatronSearchEngine():
         args = self.args
         time_config_name = "computation_profiling_%s_%s_all.json"%(args.mixed_precision, self.model_name) # TODO dynamic parse profile file
         if args.time_profiling_path is None:
-            self.time_path = os.path.join(self.path, "configs")
+            time_config_path = os.path.join(self.path, "configs")
         else:
-            self.time_path = args.time_profiling_path
-
-        self.time_path = os.path.join(self.time_path, time_config_name)
+            time_config_path = args.time_profiling_path
+        if os.path.isdir(time_config_path):
+            self.time_path = os.path.join(time_config_path, time_config_name)
+        else:
+            self.time_path = args.time_config_path
         return self.time_path
     
     def set_microbatch_func(self, microbatch_size, max_chunk):
@@ -100,8 +117,12 @@ class GalvatronSearchEngine():
     # Generating Strategies, Loading Profiled Memory & Time Config, Setting Memory & Time Cost Models
     def initialize_search_engine(self):
         self.generate_strategies()
-        self.get_profiled_model_configs()
-        self.get_profiled_hardware_configs()
+        if os.getenv("LAUNCH_BACKEND") == "ray":
+            self.get_profiled_model_configs_from_gui(self.args.gui_model_dir)
+            self.get_profiled_hardware_configs_from_gui(self.args.gui_hardware_dir)
+        else:
+            self.get_profiled_model_configs()
+            self.get_profiled_hardware_configs()
         self.set_cost_models()
         self.show_search_info()
         
@@ -257,7 +278,10 @@ class GalvatronSearchEngine():
         else:
             allreduce_bandwidth_config_path = args.allreduce_bandwidth_config_path
         allreduce_bandwidth_config_name = 'allreduce_bandwidth_%dnodes_%dgpus_per_node.json'%(args.num_nodes, args.num_gpus_per_node)
-        args.allreduce_bandwidth_config_path  = os.path.join(allreduce_bandwidth_config_path, allreduce_bandwidth_config_name)
+        if os.path.isdir(allreduce_bandwidth_config_path):
+            args.allreduce_bandwidth_config_path = os.path.join(allreduce_bandwidth_config_path, allreduce_bandwidth_config_name)
+        else:
+            args.allreduce_bandwidth_config_path = args.allreduce_bandwidth_config_path
         self.allreduce_bandwidth, self.allreduce_comm_coe = read_allreduce_bandwidth_config(args.allreduce_bandwidth_config_path, gpu_num=args.gpu_num)
         
         if args.p2p_bandwidth_config_path is None:
@@ -266,7 +290,10 @@ class GalvatronSearchEngine():
         else:
             p2p_bandwidth_config_path = args.p2p_bandwidth_config_path
         p2p_bandwidth_config_name = 'p2p_bandwidth_%dnodes_%dgpus_per_node.json'%(args.num_nodes, args.num_gpus_per_node)
-        args.p2p_bandwidth_config_path  = os.path.join(p2p_bandwidth_config_path, p2p_bandwidth_config_name)
+        if os.path.isdir(p2p_bandwidth_config_path):
+            args.p2p_bandwidth_config_path = os.path.join(p2p_bandwidth_config_path, p2p_bandwidth_config_name)
+        else:
+            args.p2p_bandwidth_config_path = args.p2p_bandwidth_config_path
         self.p2p_bandwidth, self.p2p_comm_coe = read_p2p_bandwidth_config(args.p2p_bandwidth_config_path)
         
         if args.overlap_coe_path is None:
@@ -275,7 +302,10 @@ class GalvatronSearchEngine():
         else:
             overlap_coe_path = args.overlap_coe_path
         overlap_coe_name = 'overlap_coefficient.json'
-        args.overlap_coe_path = os.path.join(overlap_coe_path, overlap_coe_name)
+        if os.path.isdir(overlap_coe_path):
+            args.overlap_coe_path = os.path.join(overlap_coe_path, overlap_coe_name)
+        else:
+            args.overlap_coe_path = args.overlap_coe_path
         self.overlap_coe = read_json_config(args.overlap_coe_path)['overlap_coe']
         if args.sp_time_path is None:
             hardware_configs_dir = '../../profile_hardware/hardware_configs/'
@@ -283,12 +313,241 @@ class GalvatronSearchEngine():
         else:
             sp_time_path = args.sp_time_path
         sp_time_config_name = 'sp_time_%dnodes_%dgpus_per_node.json'%(args.num_nodes, args.num_gpus_per_node)
-        args.sp_time_path = os.path.join(sp_time_path, sp_time_config_name)
+        if os.path.isdir(sp_time_path):
+            args.sp_time_path = os.path.join(sp_time_path, sp_time_config_name)
+        else:
+            args.sp_time_path = args.sp_time_path
         sp_config = read_json_config(args.sp_time_path)
         self.sp_allreduce = remap_config(sp_config, "allreduce")
         self.sp_all2all = remap_config(sp_config, "all2all")
 
         return self.allreduce_bandwidth, self.p2p_bandwidth, self.overlap_coe, self.sp_allreduce, self.sp_all2all
+    
+    def get_profiled_model_configs_from_gui(self, gui_model_dir):
+        """Get profiled model configs from galvatron_gui/data/profiling_results/model
+        
+        This function is used when backend is RAY and configs are stored in galvatron_gui directory
+        
+        Args:
+            gui_model_dir: Directory path for model profiling results
+        """
+        args = self.args
+
+        time_config_path = os.path.join(gui_model_dir, f"computation_profiling_{args.model_identifier}_{args.time_profile_mode}.json")
+        memory_config_path = os.path.join(gui_model_dir, f"memory_profiling_{args.model_identifier}_{args.memory_profile_mode}.json")
+
+        self.time_config = read_json_config(time_config_path)
+        self.memory_config = read_json_config(memory_config_path)
+        self.memory_config = self.convert_keys_to_int(self.memory_config)
+        
+        for k, v in self.time_config.items():
+            self.time_config[k] = v * 1000
+        
+        if self.args.time_profile_mode=='static':
+            self.time_profiled_list = []
+            self.other_time_profiled_list = []
+            for i in range(self.num_layertype):
+                for s,t in self.time_config.items():
+                    if s.startswith('layertype_%d_'%i):
+                        self.time_profiled_list.append(t)
+                    if s.startswith('layertype_other_'):
+                        self.other_time_profiled_list.append(t)
+        elif self.args.time_profile_mode == "batch":
+            self.time_profiled_list = []
+            for i in range(self.num_layertype):
+                x_data = []
+                y_data = []
+                for s,t in self.time_config.items():
+                    if s.startswith('layertype_%d_'%i) and '_seq%d'%self.seqlen_list[i] in s:
+                        x_data.append(int(s.split('_')[-2][3:]))
+                        y_data.append(t * x_data[-1])
+                assert len(x_data) >= 8, "Different bsz in computation profile of layertype_%d should not be lower than 8."%i
+                
+                def linear_func(x, m, c):
+                    return m * x + c
+                popt, pcov = curve_fit(linear_func, x_data, y_data)
+                print("Fitted parameters:", popt)
+                self.time_profiled_list.append(popt)
+            self.other_time_profiled_list = []
+            for i in range(self.num_layertype):
+                x_data = []
+                y_data = []
+                for s,t in self.time_config.items():
+                    if s.startswith('layertype_other_') and '_seq%d'%self.seqlen_list[i] in s:
+                        x_data.append(int(s.split('_')[-2][3:]))
+                        y_data.append(t * x_data[-1])
+                assert len(x_data) >= 8, "Different bsz in computation profile of layertype_other_%d should not be lower than 8."%i
+                
+                def linear_func(x, m, c):
+                    return m * x + c
+                popt, pcov = curve_fit(linear_func, x_data, y_data)
+                
+                print("Fitted parameters other:", popt)
+                self.other_time_profiled_list.append(popt)
+        elif self.args.time_profile_mode == "sequence":
+            self.time_profiled_list = []
+            for i in range(self.num_layertype):
+                x_data = []
+                y_data = []
+                for s,t in self.time_config.items():
+                    if s.startswith('layertype_%d_'%i) and "_bsz1_" in s:
+                        x_data.append(int(s.split('seq')[-1]))
+                        y_data.append(t)
+                
+                def quadratic_func(x, a, b, c):
+                    return a * x * x + b * x + c
+                popt, pcov = curve_fit(quadratic_func, x_data, y_data)
+                print("Fitted parameters:", popt)
+                self.time_profiled_list.append(quadratic_func(self.seqlen_list[i],*popt))
+            self.other_time_profiled_list = []
+            for i in range(self.num_layertype):
+                x_data = []
+                y_data = []
+                for s,t in self.time_config.items():
+                    if s.startswith('layertype_other_') and "_bsz1_" in s:
+                        x_data.append(int(s.split('seq')[-1]))
+                        y_data.append(t)
+                
+                def linear_func(x, m, c):
+                    return m * x + c
+                popt, pcov = curve_fit(linear_func, x_data, y_data)
+                print("Fitted parameters other:", popt)
+                self.other_time_profiled_list.append(linear_func(self.seqlen_list[i],*popt))
+        self.param_sizes = [0] * self.num_layertype
+        self.act_sizes = [{} for _ in range(self.num_layertype)]
+        assert self.args.memory_profile_mode == "static", "Memory profile mode must be static."
+        max_tp = self.args.max_tp_deg
+        
+        def complete_tp_dict(tp_dict, max_tp_val):
+            if not tp_dict:
+                return tp_dict
+            int_keys = {int(k) if k != 'checkpoint' else k: v for k, v in tp_dict.items()}
+            existing_tps = [k for k in int_keys.keys() if k != 'checkpoint']
+            if not existing_tps:
+                return tp_dict
+            max_existing = max(existing_tps)
+            
+            current_tp = max_existing * 2
+            while current_tp <= max_tp_val:
+                if current_tp not in int_keys:
+                    base_tp = current_tp // 2
+                    if base_tp in int_keys:
+                        int_keys[current_tp] = int_keys[base_tp] / 2.0
+                current_tp *= 2
+            
+            result = {}
+            for k, v in int_keys.items():
+                if k == 'checkpoint':
+                    result['checkpoint'] = v
+                else:
+                    # Keep as int key to match usage in cost_model.py
+                    result[k] = v
+            return result
+        
+        assert self.args.sequence_parallel, "Sequence parallel is required."
+        # Get reference seqlen from config (use max available seqlen)
+        for i in range(self.num_layertype):
+            layer_mem_config = self.memory_config['layertype_%d'%i]
+            available_seqlens = [seq if isinstance(seq, int) else int(seq) for seq in layer_mem_config.keys()]
+            ref_seqlen = max(available_seqlens)  # Use max seqlen as reference
+            actual_seqlen = self.seqlen_list[i]  # Actual seqlen to search
+            
+            # Get parameter size (doesn't scale with seqlen)
+            parameter_size = layer_mem_config[ref_seqlen]['parameter_size']
+            
+            # Get tp_activation_per_bsz_dict from reference seqlen and scale to actual seqlen
+            tp_activation_per_bsz_dict = layer_mem_config[ref_seqlen]['tp_activation_per_bsz_dict'].copy()
+            tp_activation_per_bsz_dict = complete_tp_dict(tp_activation_per_bsz_dict, max_tp)
+            # Scale activation by seqlen ratio
+            for tp in tp_activation_per_bsz_dict:
+                if tp != 'checkpoint':  # Don't scale checkpoint
+                    tp_activation_per_bsz_dict[tp] = tp_activation_per_bsz_dict[tp] / ref_seqlen * actual_seqlen
+            
+            self.param_sizes[i] = parameter_size
+            self.act_sizes[i] = tp_activation_per_bsz_dict
+        
+        # Get other_memory config from reference seqlen and scale to actual seqlen
+        # Use max seqlen from first layertype as reference
+        first_layer_config = self.memory_config['layertype_0']
+        available_seqlens = [seq if isinstance(seq, int) else int(seq) for seq in first_layer_config.keys()]
+        ref_seqlen = max(available_seqlens)
+        actual_seqlen = self.seqlen_list[0] if len(self.seqlen_list) > 0 else ref_seqlen
+        
+        # Use ref_seqlen directly as int key (not str) since convert_keys_to_int was called
+        other_memory_pp_off = self.memory_config['other_memory_pp_off'][ref_seqlen].copy()
+        other_memory_pp_on_first = self.memory_config['other_memory_pp_on_first'][ref_seqlen].copy()
+        other_memory_pp_on_last = self.memory_config['other_memory_pp_on_last'][ref_seqlen].copy()
+        
+        # Scale activation in other_memory by seqlen ratio
+        if 'activation' in other_memory_pp_off:
+            for tp in other_memory_pp_off['activation']:
+                other_memory_pp_off['activation'][tp] = other_memory_pp_off['activation'][tp] / ref_seqlen * actual_seqlen
+        if 'activation' in other_memory_pp_on_first:
+            for tp in other_memory_pp_on_first['activation']:
+                other_memory_pp_on_first['activation'][tp] = other_memory_pp_on_first['activation'][tp] / ref_seqlen * actual_seqlen
+        if 'activation' in other_memory_pp_on_last:
+            for tp in other_memory_pp_on_last['activation']:
+                other_memory_pp_on_last['activation'][tp] = other_memory_pp_on_last['activation'][tp] / ref_seqlen * actual_seqlen
+        
+        # Complete model_states and activation for other_memory_pp_off
+        if 'model_states' in other_memory_pp_off:
+            other_memory_pp_off['model_states'] = complete_tp_dict(other_memory_pp_off['model_states'], max_tp)
+        if 'activation' in other_memory_pp_off:
+            other_memory_pp_off['activation'] = complete_tp_dict(other_memory_pp_off['activation'], max_tp)
+        
+        # Complete model_states and activation for other_memory_pp_on_first
+        if 'model_states' in other_memory_pp_on_first:
+            other_memory_pp_on_first['model_states'] = complete_tp_dict(other_memory_pp_on_first['model_states'], max_tp)
+        if 'activation' in other_memory_pp_on_first:
+            other_memory_pp_on_first['activation'] = complete_tp_dict(other_memory_pp_on_first['activation'], max_tp)
+        
+        # Complete model_states and activation for other_memory_pp_on_last
+        if 'model_states' in other_memory_pp_on_last:
+            other_memory_pp_on_last['model_states'] = complete_tp_dict(other_memory_pp_on_last['model_states'], max_tp)
+        if 'activation' in other_memory_pp_on_last:
+            other_memory_pp_on_last['activation'] = complete_tp_dict(other_memory_pp_on_last['activation'], max_tp)
+        
+        self.other_memory_pp_off = other_memory_pp_off
+        self.other_memory_pp_on = {'first_stage': other_memory_pp_on_first, 'last_stage': other_memory_pp_on_last}
+
+        return self.time_config, self.memory_config
+    
+    def get_profiled_hardware_configs_from_gui(self, gui_hardware_dir):
+        """Get profiled hardware configs from galvatron_gui/data/profiling_results/hardware
+        
+        This function is used when backend is RAY and configs are stored in galvatron_gui directory
+        
+        Args:
+            gui_hardware_dir: Directory path for hardware profiling results
+        """
+        args = self.args
+        allreduce_consec0_bandwidth_config_path = os.path.join(gui_hardware_dir, 'allreduce_consec0_bandwidth_%dnodes_%dgpus_per_node.json'%(args.num_nodes, args.num_gpus_per_node))
+        allreduce_consec1_bandwidth_config_path = os.path.join(gui_hardware_dir, 'allreduce_consec1_bandwidth_%dnodes_%dgpus_per_node.json'%(args.num_nodes, args.num_gpus_per_node))
+
+        merged_config = {}
+        consec0_config = read_json_config(allreduce_consec0_bandwidth_config_path)
+        for key, value in consec0_config.items():
+            if key.startswith('allreduce_size_'):
+                size = key.replace('allreduce_size_', '')
+                merged_config[f'allreduce_size_{size}_consec_0'] = value
+            
+        consec1_config = read_json_config(allreduce_consec1_bandwidth_config_path)
+        for key, value in consec1_config.items():
+            if key.startswith('allreduce_size_'):
+                size = key.replace('allreduce_size_', '')
+                merged_config[f'allreduce_size_{size}_consec_1'] = value
+
+        self.allreduce_bandwidth, self.allreduce_comm_coe = read_allreduce_bandwidth_config(merged_config, gpu_num=args.gpu_num)
+        
+        args.p2p_bandwidth_config_path = os.path.join(gui_hardware_dir, 'p2p_bandwidth_%dnodes_%dgpus_per_node.json'%(args.num_nodes, args.num_gpus_per_node))
+        self.p2p_bandwidth, self.p2p_comm_coe = read_p2p_bandwidth_config(args.p2p_bandwidth_config_path)
+        
+        args.overlap_coe_path = os.path.join(gui_hardware_dir, 'overlap_coefficient.json')
+        self.overlap_coe = read_json_config(args.overlap_coe_path)['overlap_coe']
+        
+        args.sp_time_path = os.path.join(gui_hardware_dir, 'all2all_bandwidth_%dnodes_%dgpus_per_node.json'%(args.num_nodes, args.num_gpus_per_node))
+        self.all2all_bandwidth, self.all2all_comm_coe = read_all2all_bandwidth_config(args.sp_time_path)
+        return self.allreduce_bandwidth, self.p2p_bandwidth, self.overlap_coe, self.all2all_bandwidth, self.all2all_comm_coe
 
     def set_cost_models(self):
         self.model_args_list, self.train_args_list, self.parallel_args_list, self.profile_model_args_list, self.profile_hardware_args_list = [], [], [], [], []
@@ -328,6 +587,7 @@ class GalvatronSearchEngine():
                 costmodel_coe=self.args.costmodel_coe,
                 allreduce_dict=self.sp_allreduce,
                 all2all_dict=self.sp_all2all,
+                all2all_comm_coe=self.all2all_comm_coe,
             )
             self.model_args_list.append(model_args)
             self.train_args_list.append(train_args)
@@ -337,10 +597,29 @@ class GalvatronSearchEngine():
     
     # =============== For Galvatron Search Engine Parallelism Optimization ===============
     def parallelism_optimization(self):
+        # Create root log directory and main logger for search summary
+        root_log_dir = self.args.log_dir + '/%s_%dnodes_%dgpus_%dGB'%(self.model_name, self.args.num_nodes, self.args.num_gpus_per_node, self.memory_constraint//1024)
+        root_log_dir = ensure_log_dir(root_log_dir)
+        
+        # Create main logger for search summary (outside of search loops)
+        main_logger_name = "galvatron_search_summary"
+        main_logger = logging.getLogger(main_logger_name)
+        if not main_logger.handlers:
+            main_logger.setLevel(logging.INFO)
+            log_file = os.path.join(root_log_dir, "search_summary.log")
+            print(f"Search summary log file: {log_file}")
+            file_handler = logging.FileHandler(log_file, mode='w')
+            formatter = logging.Formatter('%(message)s')
+            file_handler.setFormatter(formatter)
+            main_logger.addHandler(file_handler)
+            main_logger.propagate = False
+        
         print('='*25, 'Galvatron Search Engine Start Searching','='*25)
+        main_logger.info('='*25 + ' Galvatron Search Engine Start Searching ' + '='*25)
         self.set_searching_bsz()
         
         print('-----', '[Searching Memory Info]', 'Memory constraint:', self.memory_constraint, 'MB', '-----')
+        main_logger.info(f'----- [Searching Memory Info] Memory constraint: {self.memory_constraint} MB -----')
         results = dict()
         self.search_history = dict()
         temp_strategies = copy.deepcopy(self.strategies)
@@ -461,10 +740,12 @@ class GalvatronSearchEngine():
             else:
                 num_threads = min(multiprocessing.cpu_count() * 2, len(all_tasks))
             print(f"Starting parallel search with {num_threads} threads for {len(all_tasks)} tasks...")
+            main_logger.info(f"Starting parallel search with {num_threads} threads for {len(all_tasks)} tasks...")
             
             def process_task(bsz, chunk, min_tp, max_tp, vsp, embed_sdp):
                 thread_id = threading.get_ident() % 1000
                 print(f"[Thread {thread_id:03d}] Start processing: bsz={bsz}, chunk={chunk}, min_tp={min_tp}, max_tp={max_tp}, vsp={vsp}, embed_sdp={embed_sdp}", flush=True)
+                main_logger.info(f"[Thread {thread_id:03d}] Start processing: bsz={bsz}, chunk={chunk}, min_tp={min_tp}, max_tp={max_tp}, vsp={vsp}, embed_sdp={embed_sdp}")
 
                 chunk_results = search_for_chunk(bsz, chunk, min_tp, max_tp, vsp, embed_sdp)
                 with results_lock:
@@ -494,6 +775,7 @@ class GalvatronSearchEngine():
                                 results[bsz][chunk][min_tp][max_tp][vsp] = dict()
                                 for embed_sdp in total_embed_sdp:
                                     print(f"Start processing: bsz={bsz}, chunk={chunk}, min_tp={min_tp}, max_tp={max_tp}, vsp={vsp}, embed_sdp={embed_sdp}", flush=True)
+                                    main_logger.info(f"Start processing: bsz={bsz}, chunk={chunk}, min_tp={min_tp}, max_tp={max_tp}, vsp={vsp}, embed_sdp={embed_sdp}")
 
                                     results[bsz][chunk][min_tp][max_tp][vsp][embed_sdp] = search_for_chunk(bsz, chunk, min_tp, max_tp, vsp, embed_sdp)
 
@@ -519,20 +801,30 @@ class GalvatronSearchEngine():
 
         if max_throughput > 0:
             print('\nFinal results of max memory %d MB:'%self.memory_constraint)
+            main_logger.info(f'\nFinal results of max memory {self.memory_constraint} MB:')
             re = results[optimal_bsz][optimal_chunk][optimal_min_tp][optimal_max_tp][optimal_vsp][optimal_embed_sdp][optimal_sp_search]
             re['vsp'] = optimal_vsp
             re['embed_sdp'] = optimal_embed_sdp
             print(f"Optimal bsz = {optimal_bsz} Optimal chunk = {optimal_chunk} Optimal vocab tp = {re['vtp']} Optimal vocab sp = {optimal_vsp} Optimal embed sdp = {optimal_embed_sdp} Max throughput={re['throughput']} samples/s")
+            main_logger.info(f"Optimal bsz = {optimal_bsz} Optimal chunk = {optimal_chunk} Optimal vocab tp = {re['vtp']} Optimal vocab sp = {optimal_vsp} Optimal embed sdp = {optimal_embed_sdp} Max throughput={re['throughput']} samples/s")
             print(f"pp_deg={re['min_pp_deg']} Minimized timecost={re['min_cost']} Memory remaining={re['mem_remain']} Memory cost={re['mem_cost']}")
+            main_logger.info(f"pp_deg={re['min_pp_deg']} Minimized timecost={re['min_cost']} Memory remaining={re['mem_remain']} Memory cost={re['mem_cost']}")
             print(f"Min_tp={optimal_min_tp} Max_tp={optimal_max_tp} ")
+            main_logger.info(f"Min_tp={optimal_min_tp} Max_tp={optimal_max_tp} ")
             print_strategies(re['min_res_list'])
+            # Log strategies to file
+            strategy_str = '\n'.join([str(s) for s in re['min_res_list']])
+            main_logger.info(f"Optimal strategies:\n{strategy_str}")
             
             self.save_results(re, optimal_bsz, optimal_chunk, optimal_pp_stage_dict)
         else:
             print("No valid configuration found.")
+            main_logger.info("No valid configuration found.")
         
         print("-----------------------------------------")
+        main_logger.info("-----------------------------------------")
         print('='*25, 'Galvatron Search Engine End Searching','='*25)
+        main_logger.info('='*25 + ' Galvatron Search Engine End Searching ' + '='*25)
 
         return max_throughput
 
@@ -544,6 +836,10 @@ class GalvatronSearchEngine():
             self.bsz_scale = 0
             self.BSZs = [args.settle_bsz]
             print('-----', '[Searching Batch Sizes Info]', 'Settle bsz:', args.settle_bsz, '-----')
+            # Get main logger if it exists
+            main_logger = logging.getLogger("galvatron_search_summary")
+            if main_logger.handlers:
+                main_logger.info(f'----- [Searching Batch Sizes Info] Settle bsz: {args.settle_bsz} -----')
             return
         self.bsz_scale = args.bsz_scale
 
@@ -557,6 +853,10 @@ class GalvatronSearchEngine():
         self.BSZs = list(range(self.min_bsz, self.max_bsz, self.bsz_scale))
         self.max_bsz = self.BSZs[-1]
         print('-----', '[Searching Batch Sizes Info]', 'Min bsz:', self.min_bsz, 'Max bsz:', self.max_bsz, 'bsz_scale:', self.bsz_scale, '-----')
+        # Get main logger if it exists
+        main_logger = logging.getLogger("galvatron_search_summary")
+        if main_logger.handlers:
+            main_logger.info(f'----- [Searching Batch Sizes Info] Min bsz: {self.min_bsz} Max bsz: {self.max_bsz} bsz_scale: {self.bsz_scale} -----')
 
     def recommend_min_bsz(self, scale):
         prune_percent = 0.65
@@ -705,10 +1005,11 @@ class GalvatronSearchEngine():
         other = []
         for i in range(self.num_layertype):
             model_args, train_args, parallel_args, profile_model_args, profile_hardware_args, layer_num = self.model_args_list[i], self.train_args_list[i], self.parallel_args_list[i], self.profile_model_args_list[i], self.profile_hardware_args_list[i], self.layernum_list[i]
-            for strategy in self.strategies:
-                re = MemoryCostModel(strategy, global_batch_size=bsz, mbsz = mbsz_dict[strategy[0]], min_tp = min_tp, 
+            for strategy in strategies:
+                re = MemoryCostModel(strategy, global_batch_size=bsz, mbsz = mbsz_dict[strategy[0]], min_tp = min_tp, max_tp = self.args.max_tp_deg,
                                      model_args=model_args, train_args=train_args, parallel_args=parallel_args, profile_model_args=profile_model_args).get_memory_cost()
                 re_total = re['enc_total']*layer_num/strategy[0]
+                print(re['other'])
                 print(form_strategy(strategy), re['enc_total'], re['other'], [re_total + re_other for re_other in re['other'][min_tp]])
                 memory[i].append(re['enc_total'])
                 memory_total[i].append(re['enc_total']*layer_num)
@@ -908,6 +1209,9 @@ class GalvatronSearchEngine():
                     new_strategies.append(copy.deepcopy(strategie))
                     strategie[-1]['sp'] = 1
                     new_strategies.append(copy.deepcopy(strategie))
+                    if strategie[2] == 1:
+                        strategie[-1]['fsdp'] = 1
+                        new_strategies.append(copy.deepcopy(strategie))
                 else:
                     new_strategies.append(copy.deepcopy(strategie))
             return new_strategies

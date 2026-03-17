@@ -1,9 +1,11 @@
 export NUM_NODES=1
 export NUM_GPUS_PER_NODE=8
 
+export LAUNCH_BACKEND="ray"
+
 MODEL_SIZE="llama-7b"
-MEMORY=36
-SEQ=2048
+MEMORY=30
+SEQ=4096
 FINE_GRAINED=1
 MODEL_ARGS="
     --model_size ${MODEL_SIZE} \
@@ -17,8 +19,8 @@ MODEL_ARGS="
     --seq_length ${SEQ}"
 
 BSZ_ARGS="
-    --min_bsz 16 \
-    --max_bsz 16 \
+    --min_bsz 64 \
+    --max_bsz 64 \
     --bsz_scale 1 \
     --settle_bsz -1 \
     --recommend_min_bsz 0
@@ -37,9 +39,8 @@ SEARCH_SPACE_ARGS="
     --max_tp_deg 8 \
     --max_pp_deg 16 \
     --fine_grained_mode ${FINE_GRAINED} \
-    --time_profile_mode batch \
+    --time_profile_mode sequence \
     --memory_profile_mode static \
-    --no_async_grad_reduce \
     --sequence_parallel
 "
 
@@ -53,6 +54,8 @@ SEARCH_ARGS="
     --mixed_precision bf16 \
     --pipeline_type pipedream_flush \
     --default_dp_type zero2 \
+    --gui_hardware_dir /home/pkuhetu/lxy/Hetu-Galvatron/galvatron_gui/data/profiling_results/hardware \
+    --gui_model_dir /home/pkuhetu/lxy/Hetu-Galvatron/galvatron_gui/data/profiling_results/model
 "
 
 BACKGROUND=1

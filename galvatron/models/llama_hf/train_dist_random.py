@@ -3,6 +3,7 @@ import os
 import torch
 from torch import nn
 from torch.optim import Adam
+from torch.profiler import profile, record_function, ProfilerActivity
 from tqdm import tqdm
 from transformers import LlamaConfig, LlamaForCausalLM
 
@@ -14,13 +15,14 @@ from galvatron.utils import distributed_dataloader, print_loss, set_seed
 from megatron.training.arguments import _print_args
 
 
-def train(args):
+def train(args, return_result=False):
     local_rank = args.local_rank
-    rank = torch.distributed.get_rank()
-    torch.cuda.set_device(local_rank)
-    device = torch.device("cuda", local_rank)
-    world_size = torch.distributed.get_world_size()
-
+    if return_result:
+        device_id = 0
+    else:
+        device_id = local_rank
+    torch.cuda.set_device(device_id)
+    device = torch.device("cuda", device_id)
     config = get_llama_config(args)
     model = llama_model_hp(config, args)
 
@@ -42,7 +44,11 @@ def train(args):
     optimizer = Adam(model.parameters(), lr=args.lr, weight_decay=args.adam_weight_decay)
 
     path = os.path.dirname(os.path.abspath(__file__))
-    profiler = get_runtime_profiler(args, path, config)
+    if return_result:
+        result = {"data": None}
+    else:
+        result = None
+    profiler = get_runtime_profiler(args, path, config, result)
 
     profiler.profile_memory(0, "After creating model")
     if local_rank == 0:
@@ -79,8 +85,34 @@ def train(args):
 
             torch.distributed.barrier()
 
+            if return_result and hasattr(profiler, 'profiling_complete') and profiler.profiling_complete:
+                return result
+
+def train_remote(overrides):
+    try:
+        args = initialize_galvatron(model_args, mode="train_dist", ignore_unknown_args=True)
+        if overrides:
+            for k, v in overrides.__dict__.items():
+                setattr(args, k, v)
+        set_seed()
+        result = train(args, return_result=True)
+        result["success"] = True
+        result["data"] = {
+            f"{args.key}": result["data"],
+        }
+        return result
+    except Exception as e:
+        import traceback
+        return {
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+            "rank": int(os.environ.get("RANK", -1)),
+            "local_rank": int(os.environ.get("LOCAL_RANK", -1))
+        }
 
 if __name__ == "__main__":
     args = initialize_galvatron(model_args, mode="train_dist")
     set_seed()
-    train(args)
+    train(args, return_result=True)
+

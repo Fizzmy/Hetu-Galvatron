@@ -48,6 +48,8 @@ def get_hybrid_parallel_configs_api(config, args, model_info):
         else:
             galvatron_config = args.galvatron_config_path
         pp_deg, tp_sizes_enc, cp_sizes_enc, tp_consecutive_flags, dp_types_enc, use_sp, vtp, vsp, vcp = config2strategy(galvatron_config)
+        ep_sizes_enc = [1] * len(tp_sizes_enc)
+        tp_of_ep_sizes_enc = [1] * len(tp_sizes_enc)
         bsz, chunks = galvatron_config["global_bsz"], galvatron_config["chunks"]
         checkpoint_flags_enc = (
             str2array(galvatron_config["checkpoint"])

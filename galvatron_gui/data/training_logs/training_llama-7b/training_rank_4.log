@@ -1,0 +1,2 @@
+/home/pkuhetu/envs/miniconda3/envs/galvatron_cu118_py310_torch260/lib/python3.10/site-packages/torch/distributed/fsdp/_init_utils.py:430: UserWarning: FSDP is switching to use `NO_SHARD` instead of ShardingStrategy.SHARD_GRAD_OP since the world size is 1.
+  warnings.warn(

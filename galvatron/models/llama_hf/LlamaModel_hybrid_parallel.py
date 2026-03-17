@@ -58,7 +58,7 @@ def construct_hybrid_parallel_model(model, model_config, training_args, hybrid_p
 
 
 def get_llama_config(args, overwrite_args=True):
-    config = config_from_meta(args.model_size)
+    config = config_from_meta(args.model_size, args.set_model_config_manually)
     config = set_model_config(config, args, overwrite_args)
     if hasattr(args, "local_rank") and args.local_rank == 0:
         print(config)
@@ -82,9 +82,9 @@ def llama_model_hp(config, args):
     return model
 
 
-def get_runtime_profiler(args, path, config, start_iter=10, end_iter=20):
+def get_runtime_profiler(args, path, config, result=None, start_iter=10, end_iter=20):
     profiler = RuntimeProfiler(args)
     profiler.set_profiler_dist(
-        path, model_layer_configs(config), model_name(config), start_iter=start_iter, end_iter=end_iter
+        path, model_layer_configs(config), model_name(config), result=result, start_iter=start_iter, end_iter=end_iter
     )
     return profiler

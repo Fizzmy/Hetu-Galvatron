@@ -19,7 +19,9 @@ path_dict = {
 }
 
 
-def config_from_meta(model_type) -> LlamaConfig:
+def config_from_meta(model_type, set_model_config_manually=False) -> LlamaConfig:
+    if set_model_config_manually:
+        return LlamaConfig()
     if isinstance(model_type, str):
         global path_dict
         path_dict = dict_join_dirname(path_dict, os.path.dirname(__file__))
@@ -57,13 +59,13 @@ def set_model_config(config, args, overwrite_args=True):
     if args.set_model_config_manually:
         config.vocab_size = args.vocab_size
         config.hidden_size = args.hidden_size
-        if args.model_size.startswith("qwen"):
-            config.intermediate_size = args.ffn_hidden_size if args.ffn_hidden_size is not None else args.hidden_size * 8 // 3
-        else:
-            config.intermediate_size = args.hidden_size * 8 // 3
+        config.intermediate_size = args.intermediate_size if args.intermediate_size is not None else args.hidden_size * 8 // 3
         config.num_hidden_layers = args.num_hidden_layers
         config.num_attention_heads = args.num_attention_heads
         config.max_position_embeddings = args.seq_length
+        config.num_key_value_heads = args.num_key_value_heads
+        config.rms_norm_eps = args.rms_norm_eps
+        config.rope_theta = args.rope_theta
     # Overwrite layer number only
     else:
         if args.set_layernum_manually:

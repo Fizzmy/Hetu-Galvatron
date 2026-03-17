@@ -1,288 +1,153 @@
 import torch
-from torch import nn
-from torch.optim import Adam
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import Dataset, DataLoader
-from torch.utils.data.distributed import DistributedSampler
-import numpy as np
-import random
-from tqdm import tqdm
-import time
+import torch.distributed as dist
 import os
-import sys
-from typing import Tuple, List
 import argparse
 
-import galvatron
-from galvatron.core.runtime.pipeline import PipelineParallel, PipeSequential
-from galvatron.core.runtime.comm_groups import gen_comm_groups
 from galvatron.utils import read_json_config, write_json_config
+from galvatron.utils.training_utils import gen_profiling_groups
 
+# Constants
+SEQ_LEN = 512
+HIDDEN_SIZE = 1024
+BYTES_PER_FLOAT16 = 2
+MB_TO_BYTES = 1024 * 1024
+WARMUP_ITERATIONS = 5
+PROFILE_ITERATIONS = 20
+ITERATIONS_PER_MEASUREMENT = 10
+TRIM_EDGES = 5  # Trim first and last N measurements for stability
 
-def init_method_constant(val):
-    def init_(tensor):
-        return torch.nn.init.constant_(tensor, val)
-    return init_
-
-class pre_sync_module(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.linear = nn.Linear(1, 1)
-    
-    def forward(self, hidden_states):
-        return hidden_states
-
-class pre_mlp(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.linear = nn.Linear(1024, 1024)
-
-    def forward(self, hidden_states):
-        hidden_states = self.linear(hidden_states)
-        return hidden_states
-
-def _reduce(input_, group):
-    """All-reduce the the input tensor across model parallel group."""
-
-    # Bypass the function if we are using only 1 GPU.
-    if torch.distributed.get_world_size(group=group)==1:
-        return input_
-
-    # All-reduce.
-    torch.distributed.all_reduce(input_.contiguous(), group=group)
-
-    return input_
-
-class _ReduceFromModelParallelRegion(torch.autograd.Function):
-    """All-reduce the input from the model parallel region."""
-    
-    @staticmethod
-    def forward(ctx, input_, group):
-        return _reduce(input_, group)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output, None
-
-class _CopyToModelParallelRegion(torch.autograd.Function):
-    """Pass the input to the model parallel region."""
-    
-    @staticmethod
-    def forward(ctx, input_, group):
-        ctx.group = group
-        return input_
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return _reduce(grad_output, ctx.group), None
-
-def reduce_from_tensor_model_parallel_region_group(input_, group):
-    return _ReduceFromModelParallelRegion.apply(input_, group)
-
-def copy_to_tensor_model_parallel_region_group(input_, group):
-    return _CopyToModelParallelRegion.apply(input_, group)
-
-class allreduce_block(nn.Module):
-    def __init__(self, tp_group):
-        super().__init__()
-        self.tp_group = tp_group
-        self.linear = nn.Linear(1024, 1024)
-
-    def forward(self, hidden_states):
-        hidden_states = copy_to_tensor_model_parallel_region_group(hidden_states, self.tp_group.group)
-        hidden_states = reduce_from_tensor_model_parallel_region_group(hidden_states, self.tp_group.group)
-        hidden_states = hidden_states.requires_grad_(True)
-        return hidden_states
-
-class DataLoaderRandom(Dataset):
-    def __init__(self, local_bsz, profile_time):
-        # world_size = torch.distributed.get_world_size()
-        self.dataset_size = local_bsz*11
-        self.input = np.random.rand(*(self.dataset_size, 512, 1024))
-        self.profile_time = profile_time
-
-    def __len__(self):
-        return self.dataset_size
-
-    def __getitem__(self, idx):
-        if idx >= self.dataset_size:
-            raise IndexError
-        if self.profile_time == 1:
-            input = torch.tensor(self.input[idx],dtype=torch.bfloat16)
-        else:
-            input = torch.FloatTensor(self.input[idx])
-        return input
-
-def fake_loss_func(labels, outputs):
-    output = outputs[0]
-    loss = output.sum()
-    loss = loss.requires_grad_(True)
-    return loss, loss
+def single_all_reduce(input_tensor, group):
+    """Perform all-reduce operation on the input tensor"""
+    dist.all_reduce(input_tensor.contiguous(), group=group)
+    return input_tensor
 
 def set_seed(rank):
     seed = 123 + rank
-    np.random.seed(seed)
-    random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
 
-def train(args):
+def train(args, return_result=False):
+    if hasattr(args, "local_rank") and args.local_rank >= 0:
+        local_rank = args.local_rank
+    else:
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    
+    # Set CUDA device BEFORE initializing process group
+    if return_result:
+        device_id = 0
+    else:
+        device_id = local_rank
+    
+    torch.cuda.set_device(device_id)
+    device = torch.device("cuda", device_id)
+    
+    # Initialize process group after setting device
     torch.distributed.init_process_group(backend="nccl")
-    local_rank = args.local_rank
     rank = torch.distributed.get_rank()
     set_seed(rank)
     world_size = torch.distributed.get_world_size()
-    node_num = world_size / args.nproc_per_node
-    # assert(args.nproc_per_node == 8)
-    torch.cuda.set_device(local_rank)
-    device = torch.device("cuda", local_rank)
+    node_num = world_size // args.nproc_per_node
 
-    # Initialize torch.profiler before initializing CUDA context to avoid the bug
-    # Refer to https://github.com/pytorch/pytorch/issues/60158
-    with torch.profiler.profile() as p:
-        pass
-
-    pp_deg = args.pp_deg
-    args.num_layers = 24
-    # args.local_batch_size = 32
-    train_batch_size_input = args.local_batch_size
     if rank == 0:
-        print('local_bsz = %d'%train_batch_size_input)
-
-    dataset = DataLoaderRandom(train_batch_size_input, args.profile_time)
-    trainloader = DataLoader(dataset=dataset,
-                            batch_size=train_batch_size_input)
-
-    all_tp_sizes = [args.global_tp_deg] * 24
-    all_sp_sizes = [1] * 24
-    all_cp_sizes = [1] * 24
-    all_ep_sizes = [1] * 24
-    all_tp_of_ep_sizes = [1] * 24
-    tp_consecutive_flags = [args.global_tp_consec] * 24
-    pp_group, tp_groups, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _ = gen_comm_groups(all_tp_sizes, all_sp_sizes, all_cp_sizes, all_ep_sizes, all_tp_of_ep_sizes, pp_deg, tp_consecutive_flags)
-
-
-    model = PipeSequential()
-    model.add_module('pre_sync_module', pre_sync_module())
-    model.add_module('pre_mlp', pre_mlp())
-    for i in range(len(all_tp_sizes)):
-        module = allreduce_block(tp_group=tp_groups[i])
-        model.add_module('mlp_%d'%i, module)
-
-    if args.profile_time == 1:
-        model = model.bfloat16()
-
-    avg_num_layers = args.num_layers // args.pp_deg
-    pp_ranks = [0, 0]
-    for i in range(args.pp_deg):
-        pp_ranks += [i] * avg_num_layers
+        print(f'local_bsz = {args.local_batch_size}')
     
-    layer_output_tensor_shapes = [[[-1, 512, 1024]]] * len(pp_ranks)
-    model = model.to(device)
-    model = PipelineParallel(
-                model = model, 
-                model_ranks = pp_ranks, 
-                layer_output_tensor_shapes = layer_output_tensor_shapes, 
-                chunks=1, 
-                process_group = pp_group.ranks, 
-                nproc_per_node=8,
-                info=False)
-    optimizer = Adam(model.parameters(), lr=0.01, weight_decay=0.01)
-
     # Calculate theoretical communication message size
     tp_size = args.global_tp_deg
-    pp_size = args.pp_deg
-    dp_size = world_size // pp_deg // tp_size
-    bs = args.local_batch_size
-    # per size: 1MB * bs when profile time == 1
-    allreduce_message_size_per_layer = 2*(tp_size-1)/tp_size*(bs*512*1024*2*4/1024/1024)
-    allreduce_message_size_total = allreduce_message_size_per_layer * 24 // pp_deg
-    if rank == 0:
-        print('Strategy: %d_%d_%d'%(pp_size,tp_size,args.global_tp_consec))
-        print('[allreduce_message_size]: per_layer %d MB, total %d MB'%(allreduce_message_size_per_layer,allreduce_message_size_total))
+    batch_size = args.local_batch_size
+    comm_group = gen_profiling_groups(tp_size, args.global_tp_consec)
+    
+    # Calculate message size: 2*(tp_size-1)/tp_size for all-reduce
+    allreduce_message_size = 2 * (tp_size - 1) / tp_size * (batch_size * SEQ_LEN * HIDDEN_SIZE * BYTES_PER_FLOAT16 / MB_TO_BYTES)
 
-    def trace_handler(prof):
-        # if rank == 0:
-        try:
-            table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=5)
-            if rank == 0:
-                print(table)
-            table = table.split('\n')
-            def split_line(line):
-                line = line.split('  ')
-                ls = []
-                for s in line:
-                    if len(s):
-                        ls.append(s.strip())
-                return ls
-            def str2time(s):
-                if 'ms' in s:
-                    return float(s[:-2])
-                elif 'us' in s:
-                    return float(s[:-2])*1e-3
-                else:
-                    return float(s[:-1])*1e3
-            for line in table:
-                if 'Name' in line:
-                    title = split_line(line)
-                if 'ncclKernel_AllReduce' in line:
-                    result = split_line(line)
-            for i in range(len(title)):
-                # print('%s: %s'%(title[i],result[i]))
-                if 'CUDA total' in title[i]:
-                    cuda_total_idx = i
-                if "Calls" in title[i]:
-                    comm_num = int(result[i])
-            comm_time = str2time(result[cuda_total_idx])
-            
-            if args.profile_time == 0:
-                allreduce_time_24_layer = comm_time / 10
-                comm_coe = allreduce_message_size_total / allreduce_time_24_layer
-                comm_coe = torch.tensor([comm_coe]).to(device)
-                torch.distributed.all_reduce(comm_coe, group=tp_groups[0].group, op=torch.distributed.ReduceOp.SUM)
-                comm_coe = comm_coe.cpu().numpy()[0] / tp_groups[0].size
-                if rank == 0:
-                    print('**********')
-                    print('comm_coe_%d_%d_%d:'%(pp_size,tp_size,args.global_tp_consec), comm_coe)
-                    print('**********')
-                    path = os.path.dirname(os.path.abspath(__file__))
-                    env_config_path = os.path.join(path, './hardware_configs/allreduce_bandwidth_%dnodes_%dgpus_per_node.json'%(node_num,args.nproc_per_node))
-                    config = read_json_config(env_config_path) if os.path.exists(env_config_path) else dict()
-                    key = 'allreduce_size_%d_consec_%d'%(tp_size,args.global_tp_consec)
-                    config[key] = comm_coe # * 2 * (args.global_tp_deg - 1) / args.global_tp_deg
-                    write_json_config(config, env_config_path)
-                    print('Already written allreduce bandwidth into env config file %s!'%(env_config_path))
-            else:
-                per_comm_time = comm_time / comm_num
-                per_comm_time = torch.tensor([per_comm_time]).to(device)
-                torch.distributed.all_reduce(per_comm_time, group=tp_groups[0].group, op=torch.distributed.ReduceOp.SUM)
-                per_comm_time = per_comm_time.cpu().numpy()[0] / tp_groups[0].size
-                if rank == 0:
-                    print('**********')
-                    print('comm_time_%dMB_%d_%d:'%(args.local_batch_size, pp_size, tp_size), per_comm_time)
-                    print('**********')
-                    path = os.path.dirname(os.path.abspath(__file__))
-                    env_config_path = os.path.join(path, './hardware_configs/sp_time_%dnodes_%dgpus_per_node.json'%(node_num,args.nproc_per_node))
-                    config = read_json_config(env_config_path) if os.path.exists(env_config_path) else dict()
-                    key = 'allreduce_size_%d_%dMB_time'%(tp_size,args.local_batch_size)
-                    config[key] = per_comm_time
-                    write_json_config(config, env_config_path)
-                    print('Already written allreduce bandwidth into env config file %s!'%(env_config_path))
-        except Exception as e:
-            print(f"Profiler error: {e}")
-            return
+    if local_rank == 0:
+        print(f'Strategy: {args.pp_deg}_{tp_size}_{args.global_tp_consec}')
+        print(f'[allreduce_message_size]: per_layer {allreduce_message_size:.2f} MB')
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    time_list = []
     
-    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA],
-                                schedule=torch.profiler.schedule(wait=0,warmup=1,active=10),
-                                on_trace_ready=trace_handler) as p:
-        for i, input in enumerate(tqdm(trainloader)):
-            input = input.to(device)
-            batch = [[input], [input]]
-            loss = model.no_pipeline_forward_backward(batch, fake_loss_func)
-            optimizer.step()
-            optimizer.zero_grad()
-            p.step()
+    # Warm-up: directly allocate on GPU
+    for _ in range(WARMUP_ITERATIONS):
+        input_tensor = torch.randn(batch_size, SEQ_LEN, HIDDEN_SIZE, dtype=torch.bfloat16, device=device)
+        single_all_reduce(input_tensor, comm_group)
     
+    # Profiling loop
+    for _ in range(PROFILE_ITERATIONS):
+        input_tensor = torch.randn(batch_size, SEQ_LEN, HIDDEN_SIZE, dtype=torch.bfloat16, device=device)
+        torch.cuda.synchronize()
+        torch.distributed.barrier(group=comm_group)
+        start.record()
+        for __ in range(ITERATIONS_PER_MEASUREMENT):
+            single_all_reduce(input_tensor, comm_group)
+        end.record()
+        torch.cuda.synchronize()
+        time_list.append(start.elapsed_time(end) / ITERATIONS_PER_MEASUREMENT)
+    
+    time_list = sorted(time_list)
+    per_comm_time = sum(time_list[TRIM_EDGES:-TRIM_EDGES]) / len(time_list[TRIM_EDGES:-TRIM_EDGES])
+    per_comm_time = torch.tensor([per_comm_time]).to(device)
+    torch.distributed.all_reduce(per_comm_time, group=comm_group, op=torch.distributed.ReduceOp.SUM)
+    per_comm_time = per_comm_time.cpu().numpy()[0] / tp_size
+    
+    def save_config(filename_template, key, value):
+        """Helper function to save configuration to file"""
+        path = os.path.dirname(os.path.abspath(__file__))
+        env_config_path = os.path.join(path, filename_template % (node_num, args.nproc_per_node))
+        config = read_json_config(env_config_path)
+        config[key] = value
+        write_json_config(config, env_config_path)
+        return env_config_path
+    
+    if args.profile_time == 0:
+        # Calculate bandwidth coefficient: total message size / total time
+        comm_coe = allreduce_message_size / per_comm_time * (1.024 ** 2)
+        if rank == 0:
+            print(f'{per_comm_time:.4f} ms, {comm_coe:.4f} GB/s')
+        if return_result:
+            final_result = {
+                "rank": rank,
+                "local_rank": local_rank,
+                "data": {
+                    f"{args.key}": float(comm_coe),
+                },
+            }
+        elif rank == 0:
+            print('**********')
+            print(f'comm_coe_{args.pp_deg}_{tp_size}_{args.global_tp_consec}: {comm_coe:.4f}')
+            print('**********')
+            key = f'allreduce_size_{tp_size}_consec_{args.global_tp_consec}'
+            env_config_path = save_config('./hardware_configs/allreduce_bandwidth_%dnodes_%dgpus_per_node.json', key, comm_coe)
+            print(f'Already written allreduce bandwidth into env config file {env_config_path}!')
+    else:
+        if rank == 0:
+            print(f'Total time: {sum(time_list):.4f} ms, Measurements: {len(time_list)}')
+            print('**********')
+            print(f'comm_time_{args.local_batch_size}MB_{args.pp_deg}_{tp_size}: {per_comm_time:.4f} ms')
+            print('**********')
+            key = f'allreduce_size_{tp_size}_{args.local_batch_size}MB_time'
+            env_config_path = save_config('./hardware_configs/sp_time_%dnodes_%dgpus_per_node.json', key, per_comm_time)
+            print(f'Already written allreduce bandwidth into env config file {env_config_path}!')
+    
+    torch.distributed.barrier()
+    torch.distributed.destroy_process_group()
+    if return_result:
+        return final_result
+
+def ray_profile_allreduce(args):
+    try:
+        result = train(args, return_result=True)
+        result["success"] = True
+        return result
+    except Exception as e:
+        import traceback
+        return {
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+            "rank": int(os.environ.get("RANK", -1)),
+            "local_rank": int(os.environ.get("LOCAL_RANK", -1))
+        }
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -299,20 +164,11 @@ if __name__ == '__main__':
         "--local_batch_size", type=int, default=32, help="local training batch size"
     )
     parser.add_argument(
-        "--num_layers", type=int, default=24, help="Number of layers"
-    )
-    parser.add_argument("--local-rank" ,type=int,default=-1)
-    parser.add_argument(
         "--nproc_per_node", type=int, default=-1, help="Nproc per node",
     )
     parser.add_argument(
         "--profile_time", type=int, default=0, help="Profile time",
     )
+    parser.add_argument("--local-rank" ,type=int,default=-1)
     args = parser.parse_args()
-    from megatron.training.global_vars import set_args
-    args.sequence_parallel = False
-    args.shape_order = "SBH"
-    args.use_ulysses = False
-    args.async_grad_reduce = True
-    set_args(args)
     train(args)

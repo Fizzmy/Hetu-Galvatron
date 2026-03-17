@@ -231,6 +231,7 @@ class ModelProfiler(BaseProfiler):
                 tp_deg = 1
                 while tp_deg <= max_tp_deg:
                     if pp_deg * tp_deg <= world_size:
+                        # TODO: determine whether to profile with vocab tp
                         for enable_vocab_tp in [0, 1]:
                             if tp_deg == 1 and enable_vocab_tp == 1:
                                 continue

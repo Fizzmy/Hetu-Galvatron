@@ -583,22 +583,22 @@ def validate_args(args, defaults={}):
         args.num_layers = args.encoder_num_layers
 
     # Check required arguments.
-    required_args = ['num_layers', 'hidden_size', 'num_attention_heads',
-                     'max_position_embeddings']
-    for req_arg in required_args:
-        _check_arg_is_not_none(args, req_arg)
+    # required_args = ['num_layers', 'hidden_size', 'num_attention_heads',
+    #                  'max_position_embeddings']
+    # for req_arg in required_args:
+    #     _check_arg_is_not_none(args, req_arg)
 
     # Checks.
-    if args.ffn_hidden_size is None:
-        if args.swiglu:
-            # reduce the dimnesion for MLP since projections happens on
-            # two linear layers. this keeps the number of paramters in
-            # the same ballpark as the counterpart with 4*h size
-            # we keep it a multiple of 64, which means the actual tensor size
-            # will be a multiple of 64 / tp_size
-            args.ffn_hidden_size = int((4 * args.hidden_size * 2 / 3) / 64) * 64
-        else:
-            args.ffn_hidden_size = 4 * args.hidden_size
+    # if args.ffn_hidden_size is None:
+    #     if args.swiglu:
+    #         # reduce the dimnesion for MLP since projections happens on
+    #         # two linear layers. this keeps the number of paramters in
+    #         # the same ballpark as the counterpart with 4*h size
+    #         # we keep it a multiple of 64, which means the actual tensor size
+    #         # will be a multiple of 64 / tp_size
+    #         args.ffn_hidden_size = int((4 * args.hidden_size * 2 / 3) / 64) * 64
+    #     else:
+    #         args.ffn_hidden_size = 4 * args.hidden_size
 
     # if args.kv_channels is None:
     #     assert args.hidden_size % args.num_attention_heads == 0

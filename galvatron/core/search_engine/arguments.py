@@ -149,4 +149,11 @@ def galvatron_search_args(parser):
     group.add_argument(
         "--log_dir", type=str, default="logs", help="Log directory for search engine."
     )
+
+    group.add_argument(
+        "--gui_hardware_dir", type=str, default=None, help="GUI hardware directory."
+    )
+    group.add_argument(
+        "--gui_model_dir", type=str, default=None, help="GUI model directory."
+    )
     return parser

@@ -1,0 +1,88 @@
+/home/pkuhetu/envs/miniconda3/envs/galvatron_cu118_py310_torch260/lib/python3.10/site-packages/torch/distributed/fsdp/_init_utils.py:430: UserWarning: FSDP is switching to use `NO_SHARD` instead of ShardingStrategy.SHARD_GRAD_OP since the world size is 1.
+  warnings.warn(
+After creating model [Allocated]
+	Max memory: 3356.03 MB	Current memory : 3230.03 MB
+
+Before Forward [Allocated]
+	Max memory: 7332.03 MB	Current memory : 7332.03 MB
+After Backward [Allocated]
+	Max memory: 13591.70 MB	Current memory : 10717.29 MB
+After optimizer_step [Allocated]
+	Max memory: 17177.32 MB	Current memory : 17177.32 MB
+| Iteration:      1 | Consumed samples:           64 | Elapsed time per iteration (ms): 38197.1 | Learning rate: 6.250000e-07 | Loss: 1.117915e+01 | grad norm: 6.13 |
+
+Before Forward [Allocated]
+	Max memory: 13949.31 MB	Current memory : 13949.31 MB
+After Backward [Allocated]
+	Max memory: 20051.73 MB	Current memory : 17177.32 MB
+After optimizer_step [Allocated]
+	Max memory: 20051.73 MB	Current memory : 17177.32 MB
+| Iteration:      2 | Consumed samples:          128 | Elapsed time per iteration (ms): 23056.1 | Learning rate: 1.250000e-06 | Loss: 1.118197e+01 | grad norm: 6.07 |
+
+Before Forward [Allocated]
+	Max memory: 13950.18 MB	Current memory : 13950.18 MB
+After Backward [Allocated]
+	Max memory: 20052.60 MB	Current memory : 17178.20 MB
+After optimizer_step [Allocated]
+	Max memory: 20052.60 MB	Current memory : 17178.20 MB
+| Iteration:      3 | Consumed samples:          192 | Elapsed time per iteration (ms): 21789.5 | Learning rate: 1.241454e-06 | Loss: 1.113860e+01 | grad norm: 5.98 |
+
+Before Forward [Allocated]
+	Max memory: 13949.31 MB	Current memory : 13949.31 MB
+After Backward [Allocated]
+	Max memory: 20051.73 MB	Current memory : 17177.32 MB
+After optimizer_step [Allocated]
+	Max memory: 20051.73 MB	Current memory : 17177.32 MB
+| Iteration:      4 | Consumed samples:          256 | Elapsed time per iteration (ms): 20776.4 | Learning rate: 1.216077e-06 | Loss: 1.104606e+01 | grad norm: 6.17 |
+
+Before Forward [Allocated]
+	Max memory: 13949.31 MB	Current memory : 13949.31 MB
+After Backward [Allocated]
+	Max memory: 20051.73 MB	Current memory : 17177.32 MB
+After optimizer_step [Allocated]
+	Max memory: 20051.73 MB	Current memory : 17177.32 MB
+| Iteration:      5 | Consumed samples:          320 | Elapsed time per iteration (ms): 21060.1 | Learning rate: 1.174639e-06 | Loss: 1.096358e+01 | grad norm: 6.15 |
+
+Before Forward [Allocated]
+	Max memory: 13950.18 MB	Current memory : 13950.18 MB
+After Backward [Allocated]
+	Max memory: 20052.60 MB	Current memory : 17178.20 MB
+After optimizer_step [Allocated]
+	Max memory: 20052.60 MB	Current memory : 17178.20 MB
+[Profiled memory for rank 7]:
+	iter_0_before_forward: 7332.03 MB
+	iter_0_after_backward: 10717.29 MB
+	iter_0_after_backward_max: 13591.70 MB
+	iter_1_before_forward: 13949.31 MB
+	iter_1_after_backward: 17177.32 MB
+	iter_1_after_backward_max: 20051.73 MB
+	iter_2_before_forward: 13950.18 MB
+	iter_2_after_backward: 17178.20 MB
+	iter_2_after_backward_max: 20052.60 MB
+	iter_3_before_forward: 13949.31 MB
+	iter_3_after_backward: 17177.32 MB
+	iter_3_after_backward_max: 20051.73 MB
+	iter_4_before_forward: 13949.31 MB
+	iter_4_after_backward: 17177.32 MB
+	iter_4_after_backward_max: 20051.73 MB
+	iter_5_before_forward: 13950.18 MB
+	iter_5_after_backward: 17178.20 MB
+	iter_5_after_backward_max: 20052.60 MB
+	model_states: 17177.32 MB
+	model_states_and_peak_activation: 20051.73 MB
+	peak_activation: 2874.41 MB
+| Iteration:      6 | Consumed samples:          384 | Elapsed time per iteration (ms): 22261.0 | Learning rate: 1.118400e-06 | Loss: 1.087967e+01 | grad norm: 6.20 |
+| Iteration:      7 | Consumed samples:          448 | Elapsed time per iteration (ms): 20559.1 | Learning rate: 1.049068e-06 | Loss: 1.079528e+01 | grad norm: 6.36 |
+| Iteration:      8 | Consumed samples:          512 | Elapsed time per iteration (ms): 20812.1 | Learning rate: 9.687500e-07 | Loss: 1.072367e+01 | grad norm: 6.42 |
+| Iteration:      9 | Consumed samples:          576 | Elapsed time per iteration (ms): 20870.0 | Learning rate: 8.798863e-07 | Loss: 1.064121e+01 | grad norm: 6.55 |
+| Iteration:     10 | Consumed samples:          640 | Elapsed time per iteration (ms): 20597.3 | Learning rate: 7.851771e-07 | Loss: 1.056054e+01 | grad norm: 6.77 |
+| Iteration:     11 | Consumed samples:          704 | Elapsed time per iteration (ms): 20738.7 | Learning rate: 6.875000e-07 | Loss: 1.050233e+01 | grad norm: 6.86 |
+| Iteration:     12 | Consumed samples:          768 | Elapsed time per iteration (ms): 21191.2 | Learning rate: 5.898229e-07 | Loss: 1.044962e+01 | grad norm: 6.86 |
+| Iteration:     13 | Consumed samples:          832 | Elapsed time per iteration (ms): 20868.5 | Learning rate: 4.951137e-07 | Loss: 1.039406e+01 | grad norm: 7.01 |
+| Iteration:     14 | Consumed samples:          896 | Elapsed time per iteration (ms): 20455.0 | Learning rate: 4.062500e-07 | Loss: 1.035509e+01 | grad norm: 7.00 |
+| Iteration:     15 | Consumed samples:          960 | Elapsed time per iteration (ms): 21200.0 | Learning rate: 3.259320e-07 | Loss: 1.031575e+01 | grad norm: 7.01 |
+| Iteration:     16 | Consumed samples:         1024 | Elapsed time per iteration (ms): 22055.4 | Learning rate: 2.566000e-07 | Loss: 1.027981e+01 | grad norm: 7.12 |
+| Iteration:     17 | Consumed samples:         1088 | Elapsed time per iteration (ms): 20785.9 | Learning rate: 2.003607e-07 | Loss: 1.026091e+01 | grad norm: 7.08 |
+| Iteration:     18 | Consumed samples:         1152 | Elapsed time per iteration (ms): 20496.4 | Learning rate: 1.589229e-07 | Loss: 1.024321e+01 | grad norm: 7.09 |
+| Iteration:     19 | Consumed samples:         1216 | Elapsed time per iteration (ms): 20702.0 | Learning rate: 1.335456e-07 | Loss: 1.022767e+01 | grad norm: 7.08 |
+| Iteration:     20 | Consumed samples:         1280 | Elapsed time per iteration (ms): 21517.7 | Learning rate: 1.250000e-07 | Loss: 1.022109e+01 | grad norm: 7.00 |
