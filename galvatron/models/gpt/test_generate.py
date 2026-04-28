@@ -148,10 +148,15 @@ def copy_hf_weights_to_galvatron(hf_model, galvatron_model, args):
         modules = list(unwrapped.named_children())
 
         for name, module in modules:
-            # Unwrap FSDP on individual modules too
+            # Unwrap FSDP and Module_with_relocation on individual modules
             m = module
-            while isinstance(m, FSDP):
-                m = m._fsdp_wrapped_module
+            while hasattr(m, '_fsdp_wrapped_module') or hasattr(m, 'module'):
+                if hasattr(m, '_fsdp_wrapped_module'):
+                    m = m._fsdp_wrapped_module
+                elif hasattr(m, 'module') and type(m).__name__ == 'Module_with_relocation':
+                    m = m.module
+                else:
+                    break
 
             if name.startswith("embedding"):
                 gv_w = m.embed_tokens.weight
