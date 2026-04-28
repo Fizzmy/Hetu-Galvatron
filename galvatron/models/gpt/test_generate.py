@@ -181,7 +181,10 @@ def copy_hf_weights_to_galvatron(hf_model, galvatron_model, args):
                     k_bias = hf_sd[f"{prefix}.self_attn.k_proj.bias"]
                     v_bias = hf_sd[f"{prefix}.self_attn.v_proj.bias"]
                     qkv_bias = torch.cat([q_bias, k_bias, v_bias], dim=0)
-                    m.attn.attention.linear_qkv.bias.data.copy_(qkv_bias)
+                    if m.attn.attention.linear_qkv.bias is not None:
+                        m.attn.attention.linear_qkv.bias.data.copy_(qkv_bias)
+                    else:
+                        print(f"[WARNING] layer {layer_idx}: linear_qkv has no bias param, skipping bias copy")
 
                 m.attn.attention.linear_proj.weight.data.copy_(
                     hf_sd[f"{prefix}.self_attn.o_proj.weight"]
