@@ -161,7 +161,8 @@ def copy_hf_weights_to_galvatron(hf_model, galvatron_model, args):
             if name.startswith("embedding"):
                 gv_w = m.embed_tokens.weight
                 hf_w = hf_sd["model.embed_tokens.weight"]
-                gv_w.data[:hf_w.shape[0]].copy_(hf_w)
+                n = min(gv_w.shape[0], hf_w.shape[0])
+                gv_w.data[:n].copy_(hf_w[:n])
 
             elif name.startswith("decoder"):
                 layer_idx = m.idx
@@ -204,7 +205,8 @@ def copy_hf_weights_to_galvatron(hf_model, galvatron_model, args):
 
             elif name.startswith("lm_head"):
                 hf_w = hf_sd.get("lm_head.weight", hf_sd["model.embed_tokens.weight"])
-                m.lm_head.weight.data[:hf_w.shape[0]].copy_(hf_w)
+                n = min(m.lm_head.weight.shape[0], hf_w.shape[0])
+                m.lm_head.weight.data[:n].copy_(hf_w[:n])
 
 
 if __name__ == "__main__":
