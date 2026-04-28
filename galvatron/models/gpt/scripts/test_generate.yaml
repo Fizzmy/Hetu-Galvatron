@@ -62,7 +62,7 @@ runtime:
     adam_beta2: 0.95
     adam_eps: 1.0e-8
     init_method_std: 0.02
-    sequence_parallel: false
+    sequence_parallel: true
     use_flash_attn: true
     global_batch_size: 1
     micro_batch_size: 1
