@@ -55,16 +55,6 @@ def test_generate(args):
         hf_path, torch_dtype=torch.bfloat16, trust_remote_code=True
     ).to(device).eval()
 
-    # Debug: inspect model structure
-    pipe_model = galvatron_model.model.model_cur_stage
-    print(f"[Rank {rank}] pipe_model type: {type(pipe_model)}")
-    for name, module in pipe_model.named_children():
-        print(f"[Rank {rank}]   {name}: {type(module).__name__}")
-        if name.startswith("decoder"):
-            for pn, p in module.named_parameters():
-                print(f"[Rank {rank}]     {pn}: {p.shape} device={p.device}")
-            break
-
     # Copy HF weights to Galvatron model
     print(f"[Rank {rank}] Copying HF weights to Galvatron model...")
     try:
@@ -74,16 +64,6 @@ def test_generate(args):
         print(f"[Rank {rank}] Weight copy FAILED: {e}")
         import traceback
         traceback.print_exc()
-
-    # Verify
-    for name, module in pipe_model.named_children():
-        if name.startswith("embedding"):
-            hf_w = hf_model.state_dict()["model.embed_tokens.weight"]
-            gv_w = module.embed_tokens.weight.data
-            print(f"[Rank {rank}] embed: hf={hf_w.shape} gv={gv_w.shape} match={torch.allclose(hf_w[:gv_w.shape[0]], gv_w.float(), atol=1e-3)}")
-            print(f"[Rank {rank}] embed gv[:3,:3]={gv_w[:3,:3]}")
-            print(f"[Rank {rank}] embed hf[:3,:3]={hf_w[:3,:3]}")
-            break
 
     # HF generate (greedy)
     print(f"[Rank {rank}] Running HF generate (greedy)...")
@@ -153,69 +133,73 @@ def copy_hf_weights_to_galvatron(hf_model, galvatron_model, args):
         model.norm
         lm_head
     """
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
     hf_sd = hf_model.state_dict()
     pipe_model = galvatron_model.model.model_cur_stage
 
-    modules = list(pipe_model.named_children())
+    # Unwrap FSDP to get PipeSequential
+    unwrapped = pipe_model
+    while isinstance(unwrapped, FSDP):
+        unwrapped = unwrapped._fsdp_wrapped_module
 
-    for name, module in modules:
-        if name.startswith("embedding"):
-            # embed_tokens
-            module.embed_tokens.weight.data.copy_(hf_sd["model.embed_tokens.weight"])
+    # Use summon_full_params to allow direct weight writes through FSDP
+    with FSDP.summon_full_params(pipe_model, writeback=True):
+        modules = list(unwrapped.named_children())
 
-        elif name.startswith("decoder"):
-            # Parse layer index from module ordering
-            layer_idx = module.idx
-            prefix = f"model.layers.{layer_idx}"
+        for name, module in modules:
+            # Unwrap FSDP on individual modules too
+            m = module
+            while isinstance(m, FSDP):
+                m = m._fsdp_wrapped_module
 
-            # Input layernorm
-            module.attn.input_layernorm.weight.data.copy_(hf_sd[f"{prefix}.input_layernorm.weight"])
+            if name.startswith("embedding"):
+                gv_w = m.embed_tokens.weight
+                hf_w = hf_sd["model.embed_tokens.weight"]
+                gv_w.data[:hf_w.shape[0]].copy_(hf_w)
 
-            # Fused QKV: Galvatron stores as single [3*h, h] or [(nq+2nkv)*d, h]
-            q_weight = hf_sd[f"{prefix}.self_attn.q_proj.weight"]
-            k_weight = hf_sd[f"{prefix}.self_attn.k_proj.weight"]
-            v_weight = hf_sd[f"{prefix}.self_attn.v_proj.weight"]
-            qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
-            module.attn.attention.linear_qkv.weight.data.copy_(qkv_weight)
+            elif name.startswith("decoder"):
+                layer_idx = m.idx
+                prefix = f"model.layers.{layer_idx}"
 
-            # QKV bias (Qwen has qkv bias)
-            if f"{prefix}.self_attn.q_proj.bias" in hf_sd:
-                q_bias = hf_sd[f"{prefix}.self_attn.q_proj.bias"]
-                k_bias = hf_sd[f"{prefix}.self_attn.k_proj.bias"]
-                v_bias = hf_sd[f"{prefix}.self_attn.v_proj.bias"]
-                qkv_bias = torch.cat([q_bias, k_bias, v_bias], dim=0)
-                module.attn.attention.linear_qkv.bias.data.copy_(qkv_bias)
+                m.attn.input_layernorm.weight.data.copy_(hf_sd[f"{prefix}.input_layernorm.weight"])
 
-            # Output projection
-            module.attn.attention.linear_proj.weight.data.copy_(
-                hf_sd[f"{prefix}.self_attn.o_proj.weight"]
-            )
+                q_weight = hf_sd[f"{prefix}.self_attn.q_proj.weight"]
+                k_weight = hf_sd[f"{prefix}.self_attn.k_proj.weight"]
+                v_weight = hf_sd[f"{prefix}.self_attn.v_proj.weight"]
+                qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
+                m.attn.attention.linear_qkv.weight.data.copy_(qkv_weight)
 
-            # Post-attention layernorm
-            module.ffn.post_attention_layernorm.weight.data.copy_(
-                hf_sd[f"{prefix}.post_attention_layernorm.weight"]
-            )
+                if f"{prefix}.self_attn.q_proj.bias" in hf_sd:
+                    q_bias = hf_sd[f"{prefix}.self_attn.q_proj.bias"]
+                    k_bias = hf_sd[f"{prefix}.self_attn.k_proj.bias"]
+                    v_bias = hf_sd[f"{prefix}.self_attn.v_proj.bias"]
+                    qkv_bias = torch.cat([q_bias, k_bias, v_bias], dim=0)
+                    m.attn.attention.linear_qkv.bias.data.copy_(qkv_bias)
 
-            # MLP: gate_proj + up_proj fused into linear_fc1
-            gate_weight = hf_sd[f"{prefix}.mlp.gate_proj.weight"]
-            up_weight = hf_sd[f"{prefix}.mlp.up_proj.weight"]
-            fc1_weight = torch.cat([gate_weight, up_weight], dim=0)
-            module.ffn.mlp.linear_fc1.weight.data.copy_(fc1_weight)
+                m.attn.attention.linear_proj.weight.data.copy_(
+                    hf_sd[f"{prefix}.self_attn.o_proj.weight"]
+                )
 
-            # MLP: down_proj → linear_fc2
-            module.ffn.mlp.linear_fc2.weight.data.copy_(
-                hf_sd[f"{prefix}.mlp.down_proj.weight"]
-            )
+                m.ffn.post_attention_layernorm.weight.data.copy_(
+                    hf_sd[f"{prefix}.post_attention_layernorm.weight"]
+                )
 
-        elif name.startswith("prenorm"):
-            module.norm.weight.data.copy_(hf_sd["model.norm.weight"])
+                gate_weight = hf_sd[f"{prefix}.mlp.gate_proj.weight"]
+                up_weight = hf_sd[f"{prefix}.mlp.up_proj.weight"]
+                fc1_weight = torch.cat([gate_weight, up_weight], dim=0)
+                m.ffn.mlp.linear_fc1.weight.data.copy_(fc1_weight)
 
-        elif name.startswith("lm_head"):
-            if "lm_head.weight" in hf_sd:
-                module.lm_head.weight.data.copy_(hf_sd["lm_head.weight"])
-            else:
-                # tied embeddings
-                module.lm_head.weight.data.copy_(hf_sd["model.embed_tokens.weight"])
+                m.ffn.mlp.linear_fc2.weight.data.copy_(
+                    hf_sd[f"{prefix}.mlp.down_proj.weight"]
+                )
+
+            elif name.startswith("prenorm"):
+                m.norm.weight.data.copy_(hf_sd["model.norm.weight"])
+
+            elif name.startswith("lm_head"):
+                hf_w = hf_sd.get("lm_head.weight", hf_sd["model.embed_tokens.weight"])
+                m.lm_head.weight.data[:hf_w.shape[0]].copy_(hf_w)
 
 
 if __name__ == "__main__":
