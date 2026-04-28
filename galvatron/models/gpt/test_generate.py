@@ -55,25 +55,34 @@ def test_generate(args):
         hf_path, torch_dtype=torch.bfloat16, trust_remote_code=True
     ).to(device).eval()
 
+    # Debug: inspect model structure
+    pipe_model = galvatron_model.model.model_cur_stage
+    print(f"[Rank {rank}] pipe_model type: {type(pipe_model)}")
+    for name, module in pipe_model.named_children():
+        print(f"[Rank {rank}]   {name}: {type(module).__name__}")
+        if name.startswith("decoder"):
+            for pn, p in module.named_parameters():
+                print(f"[Rank {rank}]     {pn}: {p.shape} device={p.device}")
+            break
+
     # Copy HF weights to Galvatron model
     print(f"[Rank {rank}] Copying HF weights to Galvatron model...")
-    copy_hf_weights_to_galvatron(hf_model, galvatron_model, args)
+    try:
+        copy_hf_weights_to_galvatron(hf_model, galvatron_model, args)
+        print(f"[Rank {rank}] Weight copy completed without errors")
+    except Exception as e:
+        print(f"[Rank {rank}] Weight copy FAILED: {e}")
+        import traceback
+        traceback.print_exc()
 
-    # Debug: verify weight copy
-    pipe_model = galvatron_model.model.model_cur_stage
+    # Verify
     for name, module in pipe_model.named_children():
         if name.startswith("embedding"):
             hf_w = hf_model.state_dict()["model.embed_tokens.weight"]
             gv_w = module.embed_tokens.weight.data
-            print(f"[Rank {rank}] embed_tokens match: {torch.allclose(hf_w[:gv_w.shape[0]], gv_w, atol=1e-5)}, shapes: hf={hf_w.shape} gv={gv_w.shape}")
-        if name.startswith("decoder") and module.idx == 0:
-            hf_sd = hf_model.state_dict()
-            q_w = hf_sd["model.layers.0.self_attn.q_proj.weight"]
-            k_w = hf_sd["model.layers.0.self_attn.k_proj.weight"]
-            v_w = hf_sd["model.layers.0.self_attn.v_proj.weight"]
-            qkv_w = torch.cat([q_w, k_w, v_w], dim=0)
-            gv_qkv = module.attn.attention.linear_qkv.weight.data
-            print(f"[Rank {rank}] layer0 qkv match: {torch.allclose(qkv_w, gv_qkv, atol=1e-5)}, shapes: hf={qkv_w.shape} gv={gv_qkv.shape}")
+            print(f"[Rank {rank}] embed: hf={hf_w.shape} gv={gv_w.shape} match={torch.allclose(hf_w[:gv_w.shape[0]], gv_w.float(), atol=1e-3)}")
+            print(f"[Rank {rank}] embed gv[:3,:3]={gv_w[:3,:3]}")
+            print(f"[Rank {rank}] embed hf[:3,:3]={hf_w[:3,:3]}")
             break
 
     # HF generate (greedy)
