@@ -25,6 +25,8 @@ from galvatron.core.runtime.args_schema import GalvatronRuntimeArgs
 from galvatron.core.runtime.models.arch import ModelInfo, BlockNames
 from galvatron.core.runtime.pipeline import PipelineParallel
 from galvatron.core.runtime import parallel_state
+from galvatron.core.runtime.transformer.inference import StaticInferenceContext
+from galvatron.core.runtime.inference.sampling import sample
 
 version_str = torch.__version__
 version_major, version_minor, _ = version_str.split(".")
@@ -77,6 +79,62 @@ class GalvatronModel(nn.Module):
             )
         self.iter += 1
         return self.loss_to_cpu(loss)
+
+    @torch.inference_mode()
+    def generate(self, input_ids, max_new_tokens, temperature=1.0, top_k=50, top_p=0.9, eos_token_id=None):
+        """Autoregressive text generation (PP=1, static batching).
+
+        Args:
+            input_ids: [batch_size, seq_len] prompt token ids.
+            max_new_tokens: Number of tokens to generate.
+            temperature: Sampling temperature (0 = greedy).
+            top_k: Top-k filtering.
+            top_p: Nucleus sampling threshold.
+            eos_token_id: Optional EOS token id for early stopping.
+
+        Returns:
+            [batch_size, seq_len + generated_len] token ids.
+        """
+        batch_size, seq_len = input_ids.shape
+        device = input_ids.device
+
+        context = StaticInferenceContext(
+            max_batch_size=batch_size,
+            max_sequence_length=seq_len + max_new_tokens,
+        )
+
+        # Shape order is SBH: transpose input_ids to [seq_len, batch_size]
+        input_ids_sbh = input_ids.transpose(0, 1).contiguous()
+
+        generated = input_ids
+
+        # Prefill: process all prompt tokens at once
+        context.enable_prefill_mode()
+        logits = self.model.forward_only(
+            input_ids_sbh, inference_context=context,
+        )  # [seq_len, batch_size, vocab_size]
+        next_token_logits = logits[-1]  # [batch_size, vocab_size]
+        next_token = sample(next_token_logits, temperature, top_k, top_p)
+        generated = torch.cat([generated, next_token.unsqueeze(1)], dim=1)
+        context.sequence_len_offset = seq_len
+
+        # Decode loop
+        context.enable_decode_mode()
+        for _ in range(max_new_tokens - 1):
+            # [1, batch_size]
+            next_input = next_token.unsqueeze(0)
+            logits = self.model.forward_only(
+                next_input, inference_context=context,
+            )  # [1, batch_size, vocab_size]
+            next_token_logits = logits[0]  # [batch_size, vocab_size]
+            next_token = sample(next_token_logits, temperature, top_k, top_p)
+            generated = torch.cat([generated, next_token.unsqueeze(1)], dim=1)
+            context.sequence_len_offset += 1
+
+            if eos_token_id is not None and (next_token == eos_token_id).all():
+                break
+
+        return generated
 
     def fake_tensor(self, x):
         return torch.zeros([x.shape[0], 1], dtype=x.dtype, device=x.device)

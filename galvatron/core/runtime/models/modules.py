@@ -74,7 +74,7 @@ class GalvatronEmbedding(nn.Module):
                 parallel_state.get_parallel_world_size(self.sp_group),
             )
 
-    def forward(self, input_ids, position_ids=None, attention_mask=None, labels=None, rotary_embedding=None):
+    def forward(self, input_ids, position_ids=None, attention_mask=None, labels=None, rotary_embedding=None, inference_context=None):
         if self.vocab_sp:
             input_ids = input_ids[:, self.seq_start:self.seq_end].contiguous()
 
@@ -175,11 +175,15 @@ class GalvatronAttention(nn.Module):
             return self.rotary_pos_emb(seq_len * self.cp_size)
         return self.rotary_pos_emb(seq_len)
 
-    def forward(self, hidden_states, position_ids, attention_mask, rotary_embedding):
+    def forward(self, hidden_states, position_ids, attention_mask, rotary_embedding, inference_context=None):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         rotary_embedding = self._get_rotary_pos_emb(hidden_states) if self.use_rope and not rotary_embedding else rotary_embedding
-        hidden_states, attn_bias = self.attention(hidden_states, attention_mask, rotary_pos_emb=rotary_embedding)
+        hidden_states, attn_bias = self.attention(
+            hidden_states, attention_mask,
+            rotary_pos_emb=rotary_embedding,
+            inference_context=inference_context,
+        )
         if attn_bias is not None:
             hidden_states = hidden_states + attn_bias
         return hidden_states + residual
@@ -229,8 +233,8 @@ class GalvatronDecoderLayer(nn.Module):
         self.attn = GalvatronAttention(args, layer_idx, tp_group, sp_group, cp_group)
         self.ffn = GalvatronMLP(args, layer_idx, tp_group, sp_group, cp_group)
 
-    def forward(self, hidden_states, position_ids=None, attention_mask=None, labels=None, rotary_embedding=None):
-        hidden_states = self.attn(hidden_states, position_ids, attention_mask, rotary_embedding)
+    def forward(self, hidden_states, position_ids=None, attention_mask=None, labels=None, rotary_embedding=None, inference_context=None):
+        hidden_states = self.attn(hidden_states, position_ids, attention_mask, rotary_embedding, inference_context=inference_context)
         hidden_states = self.ffn(hidden_states)
         return hidden_states
 
@@ -247,7 +251,7 @@ class GalvatronFinalNorm(nn.Module):
         m = args.model
         self.norm = GalvatronNorm(m, m.hidden_size, eps=m.norm_epsilon)
 
-    def forward(self, hidden_states, position_ids=None, attention_mask=None, labels=None, rotary_embedding=None):
+    def forward(self, hidden_states, position_ids=None, attention_mask=None, labels=None, rotary_embedding=None, inference_context=None):
         return self.norm(hidden_states)
 
 
@@ -312,13 +316,21 @@ class GalvatronCausalLMHead(nn.Module):
                 parallel_state.get_parallel_world_size(self.sp_group),
             )
 
-    def forward(self, hidden_states, position_ids=None, attention_mask=None, labels=None, rotary_embedding=None):
-        if self.vocab_sp:
-            labels = labels[:, self.seq_start:self.seq_end].contiguous()
+    def forward(self, hidden_states, position_ids=None, attention_mask=None, labels=None, rotary_embedding=None, inference_context=None):
         if not self.sequence_parallel:
             hidden_states = copy_to_tensor_model_parallel_region(hidden_states, self.tp_group)
 
         logits_parallel = self.lm_head(hidden_states)
+
+        # Inference mode: return gathered logits instead of loss
+        if labels is None:
+            logits = gather_from_tensor_model_parallel_region(logits_parallel, self.tp_group)
+            return logits.float()
+
+        # Training mode: compute cross-entropy loss (original logic)
+        if self.vocab_sp:
+            labels = labels[:, self.seq_start:self.seq_end].contiguous()
+
         labels = labels.transpose(0, 1).contiguous()
 
         if not self.parallel_loss:

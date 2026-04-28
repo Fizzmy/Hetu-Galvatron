@@ -384,6 +384,13 @@ class PipelineParallel(nn.Module):
 
         return losses_reduced
 
+    def forward_only(self, input_ids, position_ids=None, attention_mask=None, **kwargs):
+        """Single forward pass without microbatch splitting or loss computation (PP=1 only)."""
+        assert self.group_size == 1, "forward_only currently only supports PP=1"
+        model = self.model_cur_stage
+        output = model(input_ids, position_ids=position_ids, attention_mask=attention_mask, **kwargs)
+        return output
+
     def pipedream_flush_forward_backward(
         self,
         batch,

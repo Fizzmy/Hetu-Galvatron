@@ -23,8 +23,8 @@ class GalvatronMoEAttention(nn.Module):
         self.attn = GalvatronAttention(args, layer_idx, tp_group, sp_group, cp_group)
         self.pre_router_norm = GalvatronNorm(args.model, args.model.hidden_size, args.model.norm_epsilon)
 
-    def forward(self, hidden_states, position_ids=None, attention_mask=None, labels=None, rotary_embedding=None):
-        hidden_states = self.attn(hidden_states, position_ids, attention_mask, rotary_embedding)
+    def forward(self, hidden_states, position_ids=None, attention_mask=None, labels=None, rotary_embedding=None, inference_context=None):
+        hidden_states = self.attn(hidden_states, position_ids, attention_mask, rotary_embedding, inference_context=inference_context)
         mlp_residual = hidden_states
         hidden_states = self.pre_router_norm(hidden_states)
         return hidden_states, mlp_residual
@@ -148,8 +148,8 @@ class GalvatronMoEDecoderLayer(nn.Module):
         self.router = GalvatronMoERouter(args, layer_idx)
         self.ffn = GalvatronMoEMLP(args, layer_idx, ep_group, tp_of_ep_group, tp_and_ep_group)
 
-    def forward(self, hidden_states, position_ids=None, attention_mask=None, labels=None, rotary_embedding=None):
-        hidden_states, mlp_residual = self.attn(hidden_states, position_ids, attention_mask, rotary_embedding)
+    def forward(self, hidden_states, position_ids=None, attention_mask=None, labels=None, rotary_embedding=None, inference_context=None):
+        hidden_states, mlp_residual = self.attn(hidden_states, position_ids, attention_mask, rotary_embedding, inference_context=inference_context)
         probs, routing_map = self.router(hidden_states)
         hidden_states = self.ffn(hidden_states, mlp_residual, probs, routing_map)
         return hidden_states
