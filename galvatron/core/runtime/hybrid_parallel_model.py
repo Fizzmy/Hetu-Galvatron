@@ -103,15 +103,13 @@ class GalvatronModel(nn.Module):
             max_sequence_length=seq_len + max_new_tokens,
         )
 
-        # Shape order is SBH: transpose input_ids to [seq_len, batch_size]
-        input_ids_sbh = input_ids.transpose(0, 1).contiguous()
-
         generated = input_ids
 
         # Prefill: process all prompt tokens at once
+        # Embedding expects [batch, seq] and internally converts to [seq, batch, hidden]
         context.enable_prefill_mode()
         logits = self.model.forward_only(
-            input_ids_sbh, inference_context=context,
+            input_ids, inference_context=context,
         )  # [seq_len, batch_size, vocab_size]
         next_token_logits = logits[-1]  # [batch_size, vocab_size]
         next_token = sample(next_token_logits, temperature, top_k, top_p)
@@ -121,8 +119,8 @@ class GalvatronModel(nn.Module):
         # Decode loop
         context.enable_decode_mode()
         for _ in range(max_new_tokens - 1):
-            # [1, batch_size]
-            next_input = next_token.unsqueeze(0)
+            # Embedding expects [batch, 1]
+            next_input = next_token.unsqueeze(1)
             logits = self.model.forward_only(
                 next_input, inference_context=context,
             )  # [1, batch_size, vocab_size]
