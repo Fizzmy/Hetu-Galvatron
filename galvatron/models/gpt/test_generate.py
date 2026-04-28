@@ -59,6 +59,23 @@ def test_generate(args):
     print(f"[Rank {rank}] Copying HF weights to Galvatron model...")
     copy_hf_weights_to_galvatron(hf_model, galvatron_model, args)
 
+    # Debug: verify weight copy
+    pipe_model = galvatron_model.model.model_cur_stage
+    for name, module in pipe_model.named_children():
+        if name.startswith("embedding"):
+            hf_w = hf_model.state_dict()["model.embed_tokens.weight"]
+            gv_w = module.embed_tokens.weight.data
+            print(f"[Rank {rank}] embed_tokens match: {torch.allclose(hf_w[:gv_w.shape[0]], gv_w, atol=1e-5)}, shapes: hf={hf_w.shape} gv={gv_w.shape}")
+        if name.startswith("decoder") and module.idx == 0:
+            hf_sd = hf_model.state_dict()
+            q_w = hf_sd["model.layers.0.self_attn.q_proj.weight"]
+            k_w = hf_sd["model.layers.0.self_attn.k_proj.weight"]
+            v_w = hf_sd["model.layers.0.self_attn.v_proj.weight"]
+            qkv_w = torch.cat([q_w, k_w, v_w], dim=0)
+            gv_qkv = module.attn.attention.linear_qkv.weight.data
+            print(f"[Rank {rank}] layer0 qkv match: {torch.allclose(qkv_w, gv_qkv, atol=1e-5)}, shapes: hf={qkv_w.shape} gv={gv_qkv.shape}")
+            break
+
     # HF generate (greedy)
     print(f"[Rank {rank}] Running HF generate (greedy)...")
     with torch.no_grad():
