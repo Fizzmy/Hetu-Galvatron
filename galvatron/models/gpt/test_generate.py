@@ -99,7 +99,7 @@ def test_generate(args):
     max_diff = (hf_logits[0, :, :v].float() - gv_logits[:, 0, :v].float()).abs().max().item()
     mean_diff = (hf_logits[0, :, :v].float() - gv_logits[:, 0, :v].float()).abs().mean().item()
     print(f"[Rank {rank}] Max logit diff: {max_diff}, Mean logit diff: {mean_diff}")
-    for pos in range(seq_len):
+    for pos in range(hf_logits.shape[1]):
         hf_am = hf_logits[0, pos, :v].float().argmax().item()
         gv_am = gv_logits[pos, 0, :v].float().argmax().item()
         match_str = "OK" if hf_am == gv_am else "DIFF"
