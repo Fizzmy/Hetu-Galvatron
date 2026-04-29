@@ -101,6 +101,27 @@ _ACTIVATION_MAP: Dict[Callable, tuple] = {
 }
 
 
+def _probe_attention_bias(hf_config) -> Optional[bool]:
+    """Probe the actual HF model class to determine if QKV projections use bias."""
+    try:
+        from transformers import AutoModelForCausalLM
+        import inspect
+        cls = AutoModelForCausalLM._model_mapping[type(hf_config)]
+        src = inspect.getsource(cls)
+        # Look for q_proj/k_proj/v_proj construction with bias= parameter
+        if "bias=False" in src and "q_proj" in src:
+            return False
+        if "bias=True" in src and "q_proj" in src:
+            return True
+    except Exception:
+        pass
+    # Known model types with QKV bias
+    model_type = getattr(hf_config, "model_type", "")
+    if model_type in ("qwen2", "qwen2_moe"):
+        return True
+    return None
+
+
 def _detect_normalization(hf_config) -> str:
     if hasattr(hf_config, "rms_norm_eps"):
         return "RMSNorm"
@@ -256,6 +277,10 @@ def _fill_model_args_from_hf(args: Union[GalvatronRuntimeArgs, GalvatronSearchAr
             m.rotary_base = int(rope_theta)
 
     bias = getattr(hf_config, "attention_bias", None)
+    if bias is None:
+        # Older transformers versions don't expose attention_bias on some
+        # model configs.  Fall back to inspecting the actual HF model class.
+        bias = _probe_attention_bias(hf_config)
     if bias is not None:
         m.add_qkv_bias = bias
     mlp_bias = getattr(hf_config, "mlp_bias", None)
