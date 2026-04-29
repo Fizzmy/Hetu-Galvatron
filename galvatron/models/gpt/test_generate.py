@@ -99,6 +99,11 @@ def test_generate(args):
     max_diff = (hf_logits[0, :, :v].float() - gv_logits[:, 0, :v].float()).abs().max().item()
     mean_diff = (hf_logits[0, :, :v].float() - gv_logits[:, 0, :v].float()).abs().mean().item()
     print(f"[Rank {rank}] Max logit diff: {max_diff}, Mean logit diff: {mean_diff}")
+    for pos in range(seq_len):
+        hf_am = hf_logits[0, pos, :v].float().argmax().item()
+        gv_am = gv_logits[pos, 0, :v].float().argmax().item()
+        match_str = "OK" if hf_am == gv_am else "DIFF"
+        print(f"[Rank {rank}]   pos {pos}: HF argmax={hf_am}, GV argmax={gv_am}  {match_str}")
 
     # Galvatron generate with copied weights
     print(f"\n[Rank {rank}] Running Galvatron generate (HF weights, greedy)...")
