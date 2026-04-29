@@ -95,8 +95,9 @@ def test_generate(args):
     print(f"[Rank {rank}] GV last-token top5: {torch.topk(gv_logits[-1, 0].float(), 5)}")
     print(f"[Rank {rank}] GV last-token argmax: {gv_logits[-1, 0].float().argmax().item()}")
 
-    max_diff = (hf_logits[0].float() - gv_logits[:, 0].float()).abs().max().item()
-    mean_diff = (hf_logits[0].float() - gv_logits[:, 0].float()).abs().mean().item()
+    v = min(hf_logits.shape[-1], gv_logits.shape[-1])
+    max_diff = (hf_logits[0, :, :v].float() - gv_logits[:, 0, :v].float()).abs().max().item()
+    mean_diff = (hf_logits[0, :, :v].float() - gv_logits[:, 0, :v].float()).abs().mean().item()
     print(f"[Rank {rank}] Max logit diff: {max_diff}, Mean logit diff: {mean_diff}")
 
     # Galvatron generate with copied weights
@@ -123,6 +124,29 @@ def test_generate(args):
 
     del hf_model
     torch.cuda.empty_cache()
+
+
+def _interleave_qkv(q, k, v, num_query_groups, num_attention_heads):
+    """Interleave Q/K/V weights into Galvatron's per-group fused format.
+
+    HF stores separate [q_proj, k_proj, v_proj].
+    Galvatron's SelfAttention expects fused QKV laid out as:
+        [q_group0, k_group0, v_group0, q_group1, k_group1, v_group1, ...]
+    where q_groupX has (num_attention_heads // num_query_groups) heads.
+    """
+    heads_per_group = num_attention_heads // num_query_groups
+    head_dim = q.shape[0] // num_attention_heads
+
+    q_groups = q.view(num_query_groups, heads_per_group * head_dim, *q.shape[1:])
+    k_groups = k.view(num_query_groups, head_dim, *k.shape[1:])
+    v_groups = v.view(num_query_groups, head_dim, *v.shape[1:])
+
+    chunks = []
+    for g in range(num_query_groups):
+        chunks.append(q_groups[g])
+        chunks.append(k_groups[g])
+        chunks.append(v_groups[g])
+    return torch.cat(chunks, dim=0)
 
 
 def copy_hf_weights_to_galvatron(hf_model, galvatron_model, args):
@@ -156,6 +180,9 @@ def copy_hf_weights_to_galvatron(hf_model, galvatron_model, args):
         lm_head
     """
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+    num_attention_heads = args.model.num_attention_heads
+    num_query_groups = args.model.num_query_groups or num_attention_heads
 
     hf_sd = hf_model.state_dict()
     pipe_model = galvatron_model.model.model_cur_stage
@@ -195,14 +222,14 @@ def copy_hf_weights_to_galvatron(hf_model, galvatron_model, args):
                 q_weight = hf_sd[f"{prefix}.self_attn.q_proj.weight"]
                 k_weight = hf_sd[f"{prefix}.self_attn.k_proj.weight"]
                 v_weight = hf_sd[f"{prefix}.self_attn.v_proj.weight"]
-                qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
+                qkv_weight = _interleave_qkv(q_weight, k_weight, v_weight, num_query_groups, num_attention_heads)
                 m.attn.attention.linear_qkv.weight.data.copy_(qkv_weight)
 
                 if f"{prefix}.self_attn.q_proj.bias" in hf_sd:
                     q_bias = hf_sd[f"{prefix}.self_attn.q_proj.bias"]
                     k_bias = hf_sd[f"{prefix}.self_attn.k_proj.bias"]
                     v_bias = hf_sd[f"{prefix}.self_attn.v_proj.bias"]
-                    qkv_bias = torch.cat([q_bias, k_bias, v_bias], dim=0)
+                    qkv_bias = _interleave_qkv(q_bias, k_bias, v_bias, num_query_groups, num_attention_heads)
                     if m.attn.attention.linear_qkv.bias is not None:
                         m.attn.attention.linear_qkv.bias.data.copy_(qkv_bias)
                     else:
