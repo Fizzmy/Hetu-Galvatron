@@ -22,8 +22,13 @@ def compile_helpers():
     """Compile C++ helper functions at runtime. Make sure this is invoked on a single process."""
     import os
     import subprocess
+    import glob
 
-    command = ["make", "-C", os.path.abspath(os.path.dirname(__file__))]
+    src_dir = os.path.abspath(os.path.dirname(__file__))
+    if glob.glob(os.path.join(src_dir, "helpers_cpp*.so")):
+        return
+
+    command = ["make", "-C", src_dir]
     if subprocess.run(command).returncode != 0:
         import sys
 
