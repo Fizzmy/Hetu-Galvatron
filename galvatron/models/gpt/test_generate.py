@@ -77,8 +77,29 @@ def test_generate(args):
     print(f"[Rank {rank}] HF output shape: {hf_output.shape}")
     print(f"[Rank {rank}] HF generated: '{hf_text}'")
 
+    # ---- Diagnostic: compare prefill logits ----
+    print(f"\n[Rank {rank}] === PREFILL LOGITS DIAGNOSTIC ===")
+    with torch.no_grad():
+        hf_out = hf_model(input_ids)
+        hf_logits = hf_out.logits  # [batch, seq, vocab]
+    print(f"[Rank {rank}] HF prefill logits shape: {hf_logits.shape}")
+    print(f"[Rank {rank}] HF last-token top5: {torch.topk(hf_logits[0, -1], 5)}")
+    print(f"[Rank {rank}] HF last-token argmax: {hf_logits[0, -1].argmax().item()}")
+
+    from galvatron.core.runtime.transformer.inference import StaticInferenceContext
+    ctx = StaticInferenceContext(max_batch_size=1, max_sequence_length=128)
+    ctx.enable_prefill_mode()
+    gv_logits = galvatron_model.model.forward_only(input_ids, inference_context=ctx)
+    print(f"[Rank {rank}] GV prefill logits shape: {gv_logits.shape}")  # [seq, batch, vocab]
+    print(f"[Rank {rank}] GV last-token top5: {torch.topk(gv_logits[-1, 0].float(), 5)}")
+    print(f"[Rank {rank}] GV last-token argmax: {gv_logits[-1, 0].float().argmax().item()}")
+
+    max_diff = (hf_logits[0].float() - gv_logits[:, 0].float()).abs().max().item()
+    mean_diff = (hf_logits[0].float() - gv_logits[:, 0].float()).abs().mean().item()
+    print(f"[Rank {rank}] Max logit diff: {max_diff}, Mean logit diff: {mean_diff}")
+
     # Galvatron generate with copied weights
-    print(f"[Rank {rank}] Running Galvatron generate (HF weights, greedy)...")
+    print(f"\n[Rank {rank}] Running Galvatron generate (HF weights, greedy)...")
     galvatron_output2 = galvatron_model.generate(
         input_ids,
         max_new_tokens=16,
