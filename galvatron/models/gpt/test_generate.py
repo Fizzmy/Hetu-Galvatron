@@ -89,7 +89,8 @@ def test_generate(args):
     from galvatron.core.runtime.transformer.inference import StaticInferenceContext
     ctx = StaticInferenceContext(max_batch_size=1, max_sequence_length=128)
     ctx.enable_prefill_mode()
-    gv_logits = galvatron_model.model.forward_only(input_ids, inference_context=ctx)
+    with torch.inference_mode():
+        gv_logits = galvatron_model.model.forward_only(input_ids, inference_context=ctx)
     print(f"[Rank {rank}] GV prefill logits shape: {gv_logits.shape}")  # [seq, batch, vocab]
     print(f"[Rank {rank}] GV last-token top5: {torch.topk(gv_logits[-1, 0].float(), 5)}")
     print(f"[Rank {rank}] GV last-token argmax: {gv_logits[-1, 0].float().argmax().item()}")
